@@ -1,0 +1,247 @@
+{
+  "POS": {
+    "_title": "POSITION",
+    "_body": [
+      "Axis position display. Softkeys pick the set:",
+      "  MACH - machine (home) coordinates",
+      "  ABS  - work coordinates (active WCS + tool)",
+      "  REL  - relative counter (zeroable, display only)",
+      "  TOGO - distance remaining in current move",
+      "  ALL  - all four sets at once",
+      "",
+      "(OPRT):",
+      "  ORIGIN - zero the relative counter, all axes",
+      "  PRESET - set relative counter to typed value",
+      "  PTSPRE - reset parts counter (CAN / EXEC)"
+    ]
+  },
+  "PROG_PRGRM": {
+    "_title": "PROGRAM - DISPLAY",
+    "_body": [
+      "Loaded program; executing line in red.",
+      "Arrows / PgUp / PgDn scroll the view.",
+      "",
+      "(OPRT):",
+      "  O SRH  - load a typed O-number from the",
+      "           program directory",
+      "  N SRH  - move view to a typed N-number",
+      "  SRH v / SRH ^ - find typed text down / up",
+      "  REWIND - move view to the top"
+    ]
+  },
+  "PROG_EDIT": {
+    "_title": "PROGRAM - EDIT",
+    "_body": [
+      "Edit the loaded program (not while running).",
+      "Up/Down = line cursor, Left/Right = word cursor.",
+      "",
+      "Softkeys:",
+      "  INSERT  - add typed word(s) after the word",
+      "            (RETURN adds a new line)",
+      "  ALTER   - replace the selected word",
+      "  DEL.WRD - delete the selected word",
+      "  ALT.LIN - replace the whole line",
+      "  DEL.LIN - delete the whole line",
+      "  N SRH / SRH v / SRH ^ - search the buffer",
+      "  SAVE    - write file, reload (CAN / EXEC)",
+      "  CANCEL  - discard edits",
+      "",
+      "Physical INSERT / ALTER / DELETE act on the word."
+    ]
+  },
+  "PROG_MDI": {
+    "_title": "PROGRAM - MDI",
+    "_body": [
+      "Type one block; run with EXEC or ENTER.",
+      "Needs machine on, out of E-stop.",
+      "Words auto-space (M3S1000 -> M3 S1000).",
+      "CLEAR empties the block history."
+    ]
+  },
+  "PROG_CHECK": {
+    "_title": "PROGRAM - CHECK",
+    "_body": [
+      "Program text with live position and",
+      "distance-to-go.",
+      "ABS / REL switch the position block."
+    ]
+  },
+  "PROG_CURRNT": {
+    "_title": "PROGRAM - CURRENT BLOCK",
+    "_body": [
+      "Executing block split into words, with the",
+      "live modal G/M state alongside."
+    ]
+  },
+  "PROG_NEXT": {
+    "_title": "PROGRAM - NEXT BLOCK",
+    "_body": [
+      "Next physical block with live modal state.",
+      "Read-ahead may already be further along."
+    ]
+  },
+  "PROG_RSTR": {
+    "_title": "PROGRAM - RESTART",
+    "_body": [
+      "Run-from-line. Type an N-number or raw line",
+      "number, then SEARCH.",
+      "",
+      "The scan shows the tool, spindle, feed, coolant",
+      "and modal state that would be active there.",
+      "",
+      "M/S/T are NOT run on the way in: re-establish",
+      "tool, spindle and coolant by MDI, then EXEC.",
+      "Restart into a subroutine is blocked."
+    ]
+  },
+  "PROG_DIR": {
+    "_title": "PROGRAM - DIRECTORY",
+    "_body": [
+      "Browse the machine program directory.",
+      "RETURN / SELECT opens a folder or loads a file.",
+      "",
+      "(OPRT):",
+      "  SELECT - load file / enter folder",
+      "  O SRH  - move cursor to a typed O-number",
+      "  NEW    - create <name>.ngc",
+      "  PUNCH  - copy file to the first USB",
+      "  DELETE - delete file (CAN / EXEC)",
+      "  REFRSH - re-read the directory"
+    ]
+  },
+  "PROG_USB": {
+    "_title": "PROGRAM - USB",
+    "_body": [
+      "Browse a mounted USB drive.",
+      "",
+      "(OPRT):",
+      "  SELECT - load file / enter folder",
+      "  O SRH  - move cursor to a typed O-number",
+      "  NEW    - create <name>.ngc",
+      "  READ   - copy file into machine memory",
+      "  DELETE - delete file (CAN / EXEC)",
+      "  REFRSH - re-read the drive"
+    ]
+  },
+  "OFFSET_OFFSET": {
+    "_title": "OFFSET - TOOL TABLE",
+    "_body": [
+      "Tool length (Z), radius and comment per tool.",
+      "WEAR / GEOM pick the table; applied = geom + wear.",
+      "",
+      "(OPRT):",
+      "  NO.SRH - jump to a typed tool number",
+      "  MEASUR - type Z<ref>; length = current Z - ref",
+      "  INP.C. - copy relative counter into the field",
+      "  +INPUT - add typed value to the field",
+      "  INPUT  - set the field to the typed value",
+      "  CLEAR  - clear ALL / WEAR / GEOM",
+      "  READ / PUNCH - reload / save the tool table",
+      "",
+      "PROBE opens the tool-length probe page."
+    ]
+  },
+  "OFFSET_SETING": {
+    "_title": "OFFSET - SETTING",
+    "_body": [
+      "DISPLAY UNITS - how linear values are shown:",
+      "  MACHINE   - native machine units",
+      "  MM / INCH - forced",
+      "  PROGRAM   - follow the program G20/G21",
+      "Type a name, or INPUT to cycle. Persists.",
+      "Rotary axes are never converted."
+    ]
+  },
+  "OFFSET_WORK": {
+    "_title": "OFFSET - WORK COORDINATES",
+    "_body": [
+      "Work systems G54-G59.3; active one marked *.",
+      "Values are per axis.",
+      "",
+      "(OPRT):",
+      "  NO.SRH - jump to a system number (1-9)",
+      "  MEASUR - type axis+value; current position",
+      "           becomes that reading in the system",
+      "  +INPUT - add the typed value",
+      "  INPUT  - set the typed value",
+      "",
+      "PROBE opens the part-probe pages."
+    ]
+  },
+  "OFFSET_TPROBE": {
+    "_title": "PROBE - TOOL LENGTH",
+    "_body": [
+      "Measures tool length on the fixed sensor.",
+      "Sensor position and feeds come from",
+      "[TOOLSENSOR] in the ini.",
+      "",
+      "Z ZERO HEIGHT - the only per-cycle field:",
+      "sensor face to your intended Z zero.",
+      "",
+      "Position over the sensor, then Z.PRB (CAN / EXEC)."
+    ]
+  },
+  "OFFSET_PROBE": {
+    "_title": "PROBE - WORK",
+    "_body": [
+      "Set work offsets by touching the part. Pages:",
+      "  OUT   - outside edges and corners",
+      "  IN    - inside walls and corners",
+      "  ANGLE - edge angle (measures rotation)",
+      "  BOSS  - round/rect boss and pocket centers",
+      "  RIDGE - ridge and valley centers",
+      "  CAL   - calibrate stylus on a known gauge",
+      "",
+      "3x3 grid: green = feature, red = start,",
+      "purple = motion; centre cell is a Z touch.",
+      "Arrows pick the cell. Result writes the ACTIVE WCS.",
+      "Clearances and feeds are on P.SET.",
+      "",
+      "Position the probe, then EXEC."
+    ]
+  },
+  "OFFSET_PSET": {
+    "_title": "PROBE - SETTINGS",
+    "_body": [
+      "Shared probe parameters for every cycle:",
+      "clearances, step-off, probe feeds, calibration",
+      "offset, and boss/pocket/gauge size hints.",
+      "Type a value and INPUT. Persists."
+    ]
+  },
+  "SYSTEM": {
+    "_title": "SYSTEM",
+    "_body": [
+      "Machine configuration: ini file, joint count,",
+      "kinematics type.",
+      "",
+      "EXIT closes the interface (CAN / EXEC)."
+    ]
+  },
+  "MESSAGE": {
+    "_title": "MESSAGE / ALARM",
+    "_body": [
+      "Active alarms (red) and cleared history.",
+      "RESET (ESC) or CLEAR moves active alarms",
+      "to history. Machine faults re-raise until fixed."
+    ]
+  },
+  "GRAPHICS": {
+    "_title": "GRAPHICS - BACKPLOT",
+    "_body": [
+      "2D toolpath preview. Feed = per-tool colors,",
+      "rapids dim blue, executed path grays out live.",
+      "Marker = tool tip; orange line = A/C tool axis.",
+      "",
+      "Softkeys: XY / XZ / YZ / ISO views, ZOOM,",
+      "pan arrows, FIT, REDRAW (clear the trace)."
+    ]
+  },
+  "_DEFAULT": {
+    "_title": "HELP",
+    "_body": [
+      "No help for this page yet.",
+      "Press any softkey to close."
+    ]
+  }
+}

@@ -1,0 +1,2406 @@
+#!/usr/bin/env python3
+# screens.py — render helpers, Screen base with multi-level softkeys,
+#              all screens, and the ScreenManager.
+
+import ctypes
+import math
+import re
+import shutil
+from collections import deque
+from sdl2 import *
+from sdl2.sdlttf import *
+from backplot import Backplot2D, AXIS_COLORS
+import linuxcnc
+import json
+import os
+
+WHITE = SDL_Color(255, 255, 255)
+RED   = SDL_Color(250, 0, 0)
+BLACK = SDL_Color(0, 0, 0)
+
+STATUS_H  = 60          # content starts below this
+SOFTKEY_Y = 960         # softkey frame line
+KEY_X0, KEY_W = 60, 180 # [<] 0-60, ten keys, [>] 1860-1920
+BUFFER_H = 54           # input line band above the softkey frame
+PANE_W   = 460          # status pane width (statuspane imports this)
+
+# NOTE for the read-only-rootfs deployment: point this at the writable
+# data partition.
+WEAR_FILE = os.path.join(os.path.dirname(__file__), "tool_wear.json")
+
+WCS_PARAM_BASE = 5221   # G54 X = 5221; each system +20; axes X..W
+# 10-entry, 1-based by g5x_index (status bar):
+WCS = ("None", "G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3")
+# 9-entry, 0-based by system number (WORK table):
+WCS_NAMES = ("G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3")
+
+# LinuxCNC 9-tuple axis order — C is index 5 (B occupies 4 even if unused)
+AXIS_IDX = {"X": 0, "Y": 1, "Z": 2, "A": 3, "B": 4, "C": 5}
+
+PANE_SCREENS = {0: "LOADS", 1: "POSMODE", 2: "POSMODE", 5: "POSMODE"}
+#               POS         PROG          OFFSET        GRAPHICS
+
+# ---- probing (Probe Basic macros) ---------------------------------------
+# Shared arg list, in the macros' fixed positional order.
+PROBE_PARAMS = [
+    ("probe_tool",   "PROBE TOOL NO.",   99),
+    ("max_z",        "MAX Z DIST",       25.0),
+    ("max_xy",       "MAX XY DIST",      25.0),
+    ("xy_clear",     "XY CLEARANCE",     6.0),
+    ("z_clear",      "Z CLEARANCE",      3.0),
+    ("step_off",     "STEP-OFF WIDTH",   12.0),
+    ("extra_depth",  "EXTRA Z DEPTH",    2.0),
+    ("slow_fr",      "PROBE SLOW FR",    30.0),
+    ("fast_fr",      "PROBE FAST FR",    300.0),
+    ("cal_offset",   "CAL OFFSET",       0.0),
+    ("x_hint",       "X HINT",           0.0),
+    ("y_hint",       "Y HINT",           0.0),
+    ("dia_hint",     "DIA HINT",         10.0),
+    ("edge_width",   "EDGE WIDTH",       10.0),
+    ("probe_mode",   "MODE (0=SET WCS)", 0),
+]
+
+# page -> {(row, col): (macro, icon_kind)}
+# row 0 = back (+Y), row 2 = front (-Y); col 0 = left (-X), col 2 = right (+X)
+PZ = ("probe_z_minus_wco", "z")
+
+PROBE_PAGES = {
+    "POUT": {
+        (0, 0): ("probe_back_left_outside",   "cnr_out"),
+        (0, 1): ("probe_back_outside",        "edge_out"),
+        (0, 2): ("probe_back_right_outside",  "cnr_out"),
+        (1, 0): ("probe_left_outside",        "edge_out"),
+        (1, 1): PZ,
+        (1, 2): ("probe_right_outside",       "edge_out"),
+        (2, 0): ("probe_front_left_outside",  "cnr_out"),
+        (2, 1): ("probe_front_outside",       "edge_out"),
+        (2, 2): ("probe_front_right_outside", "cnr_out"),
+    },
+    "PIN": {
+        (0, 0): ("probe_back_left_inside",   "cnr_in"),
+        (0, 1): ("probe_y_plus_wco",         "edge_in"),
+        (0, 2): ("probe_back_right_inside",  "cnr_in"),
+        (1, 0): ("probe_x_minus_wco",        "edge_in"),
+        (1, 1): PZ,
+        (1, 2): ("probe_x_plus_wco",         "edge_in"),
+        (2, 0): ("probe_front_left_inside",  "cnr_in"),
+        (2, 1): ("probe_y_minus_wco",        "edge_in"),
+        (2, 2): ("probe_front_right_inside", "cnr_in"),
+    },
+    "PANG": {
+        (0, 0): ("probe_corner_y_plus_edge_angle",  "ang_cnr"),
+        (0, 1): ("probe_back_edge_angle",           "ang_edge"),
+        (0, 2): ("probe_corner_x_plus_edge_angle",  "ang_cnr"),
+        (1, 0): ("probe_left_edge_angle",           "ang_edge"),
+        (1, 1): PZ,
+        (1, 2): ("probe_right_edge_angle",          "ang_edge"),
+        (2, 0): ("probe_corner_x_minus_edge_angle", "ang_cnr"),
+        (2, 1): ("probe_front_edge_angle",          "ang_edge"),
+        (2, 2): ("probe_corner_y_minus_edge_angle", "ang_cnr"),
+    },
+    "PBOSS": {
+        (0, 0): ("probe_rect_boss",    "boss_rect"),
+        (0, 2): ("probe_rect_pocket",  "pkt_rect"),
+        (1, 1): PZ,
+        (2, 0): ("probe_round_boss",   "boss_round"),
+        (2, 2): ("probe_round_pocket", "pkt_round"),
+    },
+    "PRIDGE": {
+        (0, 0): ("probe_ridge_x",  "ridge_x"),
+        (0, 2): ("probe_valley_x", "valley_x"),
+        (1, 1): PZ,
+        (2, 0): ("probe_ridge_y",  "ridge_y"),
+        (2, 2): ("probe_valley_y", "valley_y"),
+    },
+    # Calibration: probe a gauge of KNOWN size to derive the ball/stylus
+    # runout correction. No centre Z — a Z touch tells you nothing about
+    # stylus diameter. Gauge size is DIA HINT on the [P.SET] page.
+    "PCAL": {
+        (0, 0): ("probe_cal_square_boss",   "boss_rect"),
+        (0, 2): ("probe_cal_square_pocket", "pkt_rect"),
+        (2, 0): ("probe_cal_round_boss",    "boss_round"),
+        (2, 2): ("probe_cal_round_pocket",  "pkt_round"),
+    },
+}
+PROBE_PAGE_KEYS = (("POUT", "OUT"), ("PIN", "IN"), ("PANG", "ANGLE"),
+                   ("PBOSS", "BOSS"), ("PRIDGE", "RIDGE"), ("PCAL", "CAL"))
+
+FEAT_C  = (60, 200, 90)     # green:  workpiece faces
+START_C = (250, 60, 60)     # red:    probe start position
+PATH_C  = (180, 120, 230)   # purple: probe motion
+
+TOOL_SENSOR_MACRO = "tool_sensor"
+
+
+# ---------------------------------------------------------------------------
+# Text rendering
+# ---------------------------------------------------------------------------
+def render_text(renderer, font, message, color=WHITE):
+    """Make a texture from a string. Caller owns it and must destroy it."""
+    surf = TTF_RenderText_Blended(font, message.encode(), color)
+    tex = SDL_CreateTextureFromSurface(renderer, surf)
+    SDL_FreeSurface(surf)
+    return tex
+
+
+def blit_text(renderer, tex, x, y):
+    w = ctypes.c_int(0)
+    h = ctypes.c_int(0)
+    SDL_QueryTexture(tex, None, None, ctypes.byref(w), ctypes.byref(h))
+    dst = SDL_Rect(x, y, w.value, h.value)
+    SDL_RenderCopy(renderer, tex, None, dst)
+
+
+def draw_line(renderer, font, text, x, y, color=WHITE):
+    """Convenience: render+blit+destroy in one call for uncached text."""
+    tex = render_text(renderer, font, text, color)
+    blit_text(renderer, tex, x, y)
+    SDL_DestroyTexture(tex)
+
+
+def text_width(font, s):
+    """Pixel width of a string in the given font (for word highlighting)."""
+    w = ctypes.c_int(0)
+    h = ctypes.c_int(0)
+    TTF_SizeUTF8(font, s.encode(), ctypes.byref(w), ctypes.byref(h))
+    return w.value
+
+
+def space_words(text):
+    """M3S1000 -> M3 S1000. Insert a space before each address letter that
+    starts a new word. Leaves comments, existing spacing, and decimals alone."""
+    parts = re.split(r'(\([^)]*\))', text)
+    out = []
+    for i, seg in enumerate(parts):
+        if i % 2 == 1:                       # a comment, pass through
+            out.append(seg)
+            continue
+        seg = re.sub(r'(?<=[\d.])\s*(?=[A-Za-z])', ' ', seg)
+        seg = re.sub(r'[ \t]+', ' ', seg)
+        out.append(seg)
+    return "".join(out).strip()
+
+
+# ---------------------------------------------------------------------------
+# Probe scenario icons — grid cells and the big diagram share one routine,
+# so they can never disagree. green = feature faces, red = probe start,
+# purple = probe motion.
+# ---------------------------------------------------------------------------
+def _pc(renderer, rgb):
+    SDL_SetRenderDrawColor(renderer, rgb[0], rgb[1], rgb[2], 255)
+
+
+def draw_circle(renderer, cx, cy, r, seg=14):
+    px = py = None
+    for i in range(seg + 1):
+        a = 2 * math.pi * i / seg
+        x, y = int(cx + r * math.cos(a)), int(cy + r * math.sin(a))
+        if px is not None:
+            SDL_RenderDrawLine(renderer, px, py, x, y)
+        px, py = x, y
+
+
+def draw_arrow(renderer, x0, y0, x1, y1, head=7):
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    SDL_RenderDrawLine(renderer, x0, y0, x1, y1)
+    ang = math.atan2(y1 - y0, x1 - x0)
+    for da in (2.6, -2.6):
+        SDL_RenderDrawLine(renderer, x1, y1,
+                           int(x1 + head * math.cos(ang + da)),
+                           int(y1 + head * math.sin(ang + da)))
+
+
+def draw_probe_icon(renderer, kind, r, c, x, y, s):
+    """One probe scenario drawn to fit the square at (x, y, s)."""
+    q = s / 5.0
+    cx, cy = x + s / 2.0, y + s / 2.0
+    hd = max(4, int(q * 0.45))          # arrowhead size
+    rad = max(3, int(q * 0.42))         # start-circle radius
+
+    def feat(x0, y0, x1, y1):
+        _pc(renderer, FEAT_C)
+        SDL_RenderDrawLine(renderer, int(x0), int(y0), int(x1), int(y1))
+
+    def start(px, py):
+        _pc(renderer, START_C)
+        draw_circle(renderer, px, py, rad)
+
+    def path(x0, y0, x1, y1):
+        _pc(renderer, PATH_C)
+        draw_arrow(renderer, x0, y0, x1, y1, hd)
+
+    def leg(x0, y0, x1, y1):            # non-arrow leg of an L path
+        _pc(renderer, PATH_C)
+        SDL_RenderDrawLine(renderer, int(x0), int(y0), int(x1), int(y1))
+
+    if kind == "z":
+        feat(cx - 1.3 * q, cy + 1.2 * q, cx + 1.3 * q, cy + 1.2 * q)
+        start(cx, cy - 1.3 * q)
+        path(cx, cy - 0.7 * q, cx, cy + 0.85 * q)
+        return
+
+    if kind in ("edge_out", "edge_in", "ang_edge"):
+        tilt = 0.35 * q if kind == "ang_edge" else 0.0
+        inside = (kind == "edge_in")
+        if r in (0, 2):                            # horizontal face
+            if inside:
+                fy = (y + 1.0 * q) if r == 0 else (y + s - 1.0 * q)
+            else:
+                fy = cy
+            feat(cx - 1.7 * q, fy - tilt, cx + 1.7 * q, fy + tilt)
+            sy = cy if inside else (y + 0.9 * q if r == 0 else y + s - 0.9 * q)
+            sx = cx if not tilt else cx - 1.0 * q
+            start(sx, sy)
+            d = 1.0 if fy > sy else -1.0
+            path(sx, sy + d * 0.7 * q, sx, fy - d * 0.35 * q)
+            if tilt:
+                path(cx + 1.0 * q, sy + d * 0.7 * q,
+                     cx + 1.0 * q, fy + tilt - d * 0.35 * q)
+        else:                                      # vertical face
+            if inside:
+                fx = (x + 1.0 * q) if c == 0 else (x + s - 1.0 * q)
+            else:
+                fx = cx
+            feat(fx - tilt, cy - 1.7 * q, fx + tilt, cy + 1.7 * q)
+            sx = cx if inside else (x + 0.9 * q if c == 0 else x + s - 0.9 * q)
+            sy = cy if not tilt else cy - 1.0 * q
+            start(sx, sy)
+            d = 1.0 if fx > sx else -1.0
+            path(sx + d * 0.7 * q, sy, fx - d * 0.35 * q, sy)
+            if tilt:
+                path(sx + d * 0.7 * q, cy + 1.0 * q,
+                     fx + tilt - d * 0.35 * q, cy + 1.0 * q)
+        return
+
+    if kind in ("cnr_out", "ang_cnr"):
+        hx = 1.0 if c == 0 else -1.0        # horizontal face extends this way
+        vy = 1.0 if r == 0 else -1.0        # vertical face extends this way
+        feat(cx, cy, cx + hx * 2.1 * q, cy)
+        feat(cx, cy, cx, cy + vy * 2.1 * q)
+        sx = x + 0.9 * q if c == 0 else x + s - 0.9 * q
+        sy = y + 0.9 * q if r == 0 else y + s - 0.9 * q
+        start(sx, sy)
+        ax = cx + hx * 1.35 * q                          # touch the H face
+        leg(sx, sy, ax, sy)
+        path(ax, sy, ax, cy - vy * 0.35 * q)
+        by = cy + vy * 1.35 * q                          # touch the V face
+        leg(sx, sy, sx, by)
+        path(sx, by, cx - hx * 0.35 * q, by)
+        return
+
+    if kind == "cnr_in":
+        hx = 1.0 if c == 0 else -1.0
+        vy = 1.0 if r == 0 else -1.0
+        vx = x + 1.1 * q if c == 0 else x + s - 1.1 * q
+        vyp = y + 1.1 * q if r == 0 else y + s - 1.1 * q
+        feat(vx, vyp, vx + hx * 2.2 * q, vyp)
+        feat(vx, vyp, vx, vyp + vy * 2.2 * q)
+        start(cx, cy)
+        path(cx - hx * 0.2 * q, cy, vx + hx * 0.35 * q, cy)
+        path(cx, cy - vy * 0.2 * q, cx, vyp + vy * 0.35 * q)
+        return
+
+    if kind in ("boss_rect", "boss_round", "pkt_rect", "pkt_round"):
+        boss = kind.startswith("boss")
+        _pc(renderer, FEAT_C)
+        if kind.endswith("round"):
+            draw_circle(renderer, cx, cy, 1.35 * q)
+        else:
+            SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 1.5 * q),
+                                                  int(cy - 1.15 * q),
+                                                  int(3.0 * q), int(2.3 * q)))
+        if boss:                                   # approach inward
+            start(x + 0.9 * q, cy)
+            path(x + 1.5 * q, cy, cx - 1.75 * q, cy)
+            path(cx, y + 0.75 * q, cx, cy - 1.6 * q)
+        else:                                      # from centre outward
+            start(cx, cy)
+            path(cx - 0.35 * q, cy, cx - 1.15 * q, cy)
+            path(cx + 0.35 * q, cy, cx + 1.15 * q, cy)
+            path(cx, cy - 0.35 * q, cx, cy - 0.95 * q)
+        return
+
+    if kind in ("ridge_x", "ridge_y", "valley_x", "valley_y"):
+        ridge = kind.startswith("ridge")
+        horiz = kind.endswith("_x")                # motion along X
+        _pc(renderer, FEAT_C)
+        if ridge:
+            if horiz:
+                SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 0.9 * q),
+                                                      int(cy - 1.6 * q),
+                                                      int(1.8 * q), int(3.2 * q)))
+                start(cx, y + 0.85 * q)
+                path(cx - 2.0 * q, cy, cx - 1.15 * q, cy)
+                path(cx + 2.0 * q, cy, cx + 1.15 * q, cy)
+            else:
+                SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 1.6 * q),
+                                                      int(cy - 0.9 * q),
+                                                      int(3.2 * q), int(1.8 * q)))
+                start(x + 0.85 * q, cy)
+                path(cx, cy - 2.0 * q, cx, cy - 1.15 * q)
+                path(cx, cy + 2.0 * q, cx, cy + 1.15 * q)
+        else:                                      # valley: gap in the middle
+            if horiz:
+                feat(cx - 2.0 * q, cy - 1.4 * q, cx - 0.9 * q, cy - 1.4 * q)
+                feat(cx - 0.9 * q, cy - 1.4 * q, cx - 0.9 * q, cy + 1.4 * q)
+                feat(cx + 2.0 * q, cy - 1.4 * q, cx + 0.9 * q, cy - 1.4 * q)
+                feat(cx + 0.9 * q, cy - 1.4 * q, cx + 0.9 * q, cy + 1.4 * q)
+                start(cx, cy)
+                path(cx - 0.35 * q, cy, cx - 0.6 * q, cy)
+                path(cx + 0.35 * q, cy, cx + 0.6 * q, cy)
+            else:
+                feat(cx - 1.4 * q, cy - 2.0 * q, cx - 1.4 * q, cy - 0.9 * q)
+                feat(cx - 1.4 * q, cy - 0.9 * q, cx + 1.4 * q, cy - 0.9 * q)
+                feat(cx - 1.4 * q, cy + 2.0 * q, cx - 1.4 * q, cy + 0.9 * q)
+                feat(cx - 1.4 * q, cy + 0.9 * q, cx + 1.4 * q, cy + 0.9 * q)
+                start(cx, cy)
+                path(cx, cy - 0.35 * q, cx, cy - 0.6 * q)
+                path(cx, cy + 0.35 * q, cx, cy + 0.6 * q)
+        return
+
+
+# ---------------------------------------------------------------------------
+# Input buffer + field cursor (single definitions — do not duplicate)
+# ---------------------------------------------------------------------------
+class InputBuffer:
+    """Global key buffer. Fed by SDL_TEXTINPUT, always uppercase."""
+    ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789()?,@#=*-.[]&+/; ")
+    MAXLEN = 64
+
+    def __init__(self):
+        self.text = ""
+
+    def feed(self, s):                # printable chars from SDL_TEXTINPUT
+        for ch in s.upper():
+            if ch in self.ALLOWED and len(self.text) < self.MAXLEN:
+                self.text += ch
+
+    def backspace(self):
+        self.text = self.text[:-1]
+
+    def clear(self):                  # bind to a CAN softkey
+        self.text = ""
+
+    def take(self):                   # commit: returns contents and empties
+        t, self.text = self.text, ""
+        return t
+
+
+class Field:
+    __slots__ = ("x", "y", "w", "h", "setter", "getter")
+    def __init__(self, x, y, w, h, setter=None, getter=None):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.setter = setter          # called with display-units text on commit
+        self.getter = getter          # must return DISPLAY units (+INPUT adds
+                                      # typed display value to it, then setter
+                                      # divides back to machine)
+
+
+class FieldCursor:
+    """Grid of selectable fields: up/down move by rows, left/right by one."""
+    def __init__(self, cols=1):
+        self.fields = []
+        self.idx = 0
+        self.cols = cols
+
+    def add(self, x, y, w, h, setter=None, getter=None):
+        self.fields.append(Field(x, y, w, h, setter, getter))
+        return len(self.fields) - 1
+
+    def move(self, d):                    # rows
+        if self.fields:
+            self.idx = (self.idx + d * self.cols) % len(self.fields)
+
+    def move_h(self, d):                  # columns
+        if self.fields:
+            self.idx = (self.idx + d) % len(self.fields)
+
+    def goto_row(self, row):
+        if self.fields:
+            self.idx = max(0, min(row * self.cols, len(self.fields) - 1))
+
+    def row(self):
+        return self.idx // self.cols
+
+    def is_current(self, i):
+        return bool(self.fields) and i == self.idx
+
+    def current(self):
+        return self.fields[self.idx] if self.fields else None
+
+    def commit(self, text):
+        f = self.current()
+        if f and text and f.setter:
+            f.setter(text)
+            return True
+        return False
+
+    def commit_add(self, text):           # +INPUT
+        f = self.current()
+        if f and text and f.setter and f.getter:
+            try:
+                f.setter(str(f.getter() + float(text)))
+                return True
+            except ValueError:
+                pass
+        return False
+
+
+def draw_field(renderer, font, text, i, cursor, pad=6):
+    """Draw one field; reverse-video if the cursor is on it."""
+    f = cursor.fields[i]
+    if cursor.is_current(i):
+        SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+        SDL_RenderFillRect(renderer, SDL_Rect(f.x, f.y, f.w, f.h))
+        draw_line(renderer, font, text, f.x + pad, f.y + 2, BLACK)
+    else:
+        draw_line(renderer, font, text, f.x + pad, f.y + 2)
+
+
+# ---------------------------------------------------------------------------
+# Softkey machinery
+# ---------------------------------------------------------------------------
+class K:
+    """One softkey: label + zero-arg action. Blank label = dead key."""
+    __slots__ = ("label", "action")
+    def __init__(self, label="", action=None):
+        self.label = label
+        self.action = action
+
+
+def _pad10(items):
+    items = list(items)[:10]
+    return items + [K()] * (10 - len(items))
+
+
+class Screen:
+    """Base screen. Softkey menus are a stack of levels; each level is a
+    list of pages; each page is exactly 10 K items (slots F2..F11).
+    Slot 0 ([<], F1) and slot 11 ([>], F12) are auto-managed:
+      [<] shows only when there's a level to return to,
+      [>] shows only when the current level has multiple pages."""
+
+    def __init__(self, app):
+        self.app = app
+        self._stack = []
+        self.cursor = None
+        self.set_root([K()] * 10)
+
+    # ---- menu machinery ----
+    @staticmethod
+    def _as_pages(x):
+        return x if (x and isinstance(x[0], list)) else [x]
+
+    def set_root(self, pages):
+        self._stack = [[[_pad10(p) for p in self._as_pages(pages)], 0]]
+
+    def push(self, pages):
+        self._stack.append([[_pad10(p) for p in self._as_pages(pages)], 0])
+
+    def pop(self):
+        if len(self._stack) > 1:
+            self._stack.pop()
+
+    def next_page(self):
+        top = self._stack[-1]
+        top[1] = (top[1] + 1) % len(top[0])
+
+    def _page(self):
+        pages, idx = self._stack[-1]
+        return pages[idx]
+
+    # ---- called by the manager ----
+    def softkey_labels(self):
+        pages, _ = self._stack[-1]
+        left  = "<" if len(self._stack) > 1 else ""
+        right = ">" if len(pages) > 1 else ""
+        return [left] + [it.label for it in self._page()] + [right]
+
+    def on_softkey(self, i):
+        if i == 0:
+            self.pop()
+        elif i == 11:
+            self.next_page()
+        else:
+            item = self._page()[i - 1]
+            if item.action:
+                item.action()
+
+    # ---- override per screen ----
+    def on_enter(self):
+        pass
+
+    def on_key(self, sc):
+        if self.cursor:
+            if sc == SDL_SCANCODE_UP:       self.cursor.move(-1);   return True
+            if sc == SDL_SCANCODE_DOWN:     self.cursor.move(+1);   return True
+            if sc == SDL_SCANCODE_LEFT:     self.cursor.move_h(-1); return True
+            if sc == SDL_SCANCODE_RIGHT:    self.cursor.move_h(+1); return True
+            if sc == SDL_SCANCODE_PAGEUP:   self.cursor.move(-8);   return True
+            if sc == SDL_SCANCODE_PAGEDOWN: self.cursor.move(+8);   return True
+            if sc == SDL_SCANCODE_RETURN:
+                return self.cursor.commit(self.app.input.take())
+        return False
+
+    def draw(self, renderer, area):
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Screens
+# ---------------------------------------------------------------------------
+class PosScreen(Screen):
+
+    def _dro_pitch(self):
+        return 150 if len(self.app.axes) > 3 else 200
+
+    def on_enter(self):
+        self.sub = getattr(self, "sub", "MACH")     # keep last sub-page
+        self.set_root([
+            K("ABS",  lambda: setattr(self, "sub", "ABS")),
+            K("REL",  lambda: setattr(self, "sub", "REL")),
+            K("MACH", lambda: setattr(self, "sub", "MACH")),
+            K("ALL",  lambda: setattr(self, "sub", "ALL")),
+            K("TOGO", lambda: setattr(self, "sub", "TOGO")),
+            K(), K(), K(), K(),
+            K("(OPRT)", self._oprt),
+        ])
+
+    def _oprt(self):
+        self.push([
+            K("ORIGIN", self._zero_rel),
+            K("PRESET", self._preset),
+            K("PTSPRE", lambda: self.push([          # parts counter reset
+                K("CAN", self.pop),
+                K("EXEC", lambda: (self.app.pane.reset_parts(), self.pop())),
+            ])),
+        ])
+
+    def _preset(self):
+        """Set the relative counter: type axis+value (e.g. X5.0), press PRESET.
+        Typed value is in display units."""
+        txt = self.app.input.take().strip()
+        if not txt or txt[0] not in self.app.axes:
+            return
+        try:
+            val = float(txt[1:])
+        except ValueError:
+            return
+        ax = txt[0]
+        idx = AXIS_IDX[ax]
+        val_m = self.app.disp_to_machine(ax, val)
+        self.app.rel_origin[idx] = self.app.stat.actual_position[idx] - val_m
+
+    def _zero_rel(self):
+        st = self.app.stat
+        for ax in self.app.axes:
+            idx = AXIS_IDX[ax]
+            self.app.rel_origin[idx] = st.actual_position[idx]
+
+    def _rel(self, st, idx):
+        return st.actual_position[idx] - self.app.rel_origin[idx]
+
+    def _work(self, st, idx):
+        return (st.actual_position[idx] - st.g5x_offset[idx]
+                - st.g92_offset[idx] - st.tool_offset[idx])
+
+    def draw(self, renderer, area):
+        st, lf, f = self.app.stat, self.app.large_font, self.app.font
+        app = self.app
+        axes = app.axes
+        pitch = self._dro_pitch()
+
+        def rows(valfn, title):
+            draw_line(renderer, f, title, 10, 80)
+            for r, ax in enumerate(axes):
+                idx = AXIS_IDX[ax]
+                draw_line(renderer, lf,
+                          "{}  {}".format(ax, app.fmt_axis(ax, valfn(idx))),
+                          10, 120 + r * pitch)
+
+        if self.sub == "MACH":
+            rows(lambda i: st.position[i], "MACHINE")
+        elif self.sub == "ABS":
+            rows(lambda i: self._work(st, i), "ABSOLUTE")
+        elif self.sub == "REL":
+            rows(lambda i: self._rel(st, i), "RELATIVE")
+        elif self.sub == "TOGO":
+            rows(lambda i: st.dtg[i], "TO GO")
+        else:  # ALL — lower section y derived from axis count
+            n = len(axes)
+            y2 = 150 + n * 70 + 60
+            draw_line(renderer, f, "MACHINE", 10, 80)
+            draw_line(renderer, f, "ABSOLUTE", 960, 80)
+            draw_line(renderer, f, "RELATIVE", 10, y2 - 70)
+            draw_line(renderer, f, "TO GO", 960, y2 - 70)
+            for r, ax in enumerate(axes):
+                idx = AXIS_IDX[ax]
+                draw_line(renderer, f, "{}  {}".format(
+                    ax, app.fmt_axis(ax, st.position[idx])), 10, 150 + r * 70)
+                draw_line(renderer, f, "{}  {}".format(
+                    ax, app.fmt_axis(ax, self._work(st, idx))), 960, 150 + r * 70)
+                draw_line(renderer, f, "{}  {}".format(
+                    ax, app.fmt_axis(ax, self._rel(st, idx))), 10, y2 + r * 70)
+                draw_line(renderer, f, "{}  {}".format(
+                    ax, app.fmt_axis(ax, st.dtg[idx])), 960, y2 + r * 70)
+
+
+def scan_modals(lines, upto):
+    """Text-scan program lines[0:upto] and collect last-seen modal words.
+    Pure text scan (not the interpreter) — for the RSTR/CURRNT displays.
+    Returns dict; 'oword' flags any o-word sub/call before the target,
+    where run-from-line is unreliable."""
+    out = {"T": None, "S": None, "F": None, "spindle": "M5", "coolant": "M9",
+           "units": None, "wcs": None, "tlo": None, "plane": None,
+           "dist": None, "oword": False}
+    word_re = re.compile(r'([A-Za-z])\s*([+-]?\d*\.?\d+)')
+    for raw in lines[:upto]:
+        s = re.sub(r'\([^)]*\)', '', raw).split(';')[0]
+        if re.match(r'\s*[oO][\w<>]+\s+(sub|call|do|while|repeat|if)\b', s,
+                    re.IGNORECASE):
+            out["oword"] = True
+        for letter, num in word_re.findall(s):
+            L = letter.upper()
+            try:
+                v = float(num)
+            except ValueError:
+                continue
+            if L == "T":
+                out["T"] = int(v)
+            elif L == "S":
+                out["S"] = v
+            elif L == "F":
+                out["F"] = v
+            elif L == "M":
+                m = int(v)
+                if m in (3, 4, 5):
+                    out["spindle"] = f"M{m}"
+                elif m in (7, 8, 9):
+                    out["coolant"] = f"M{m}"
+            elif L == "G":
+                g = round(v, 1)
+                if g in (20, 21):
+                    out["units"] = f"G{int(g)}"
+                elif 54 <= g <= 59.3:
+                    out["wcs"] = f"G{g:g}"
+                elif g in (43, 49):
+                    out["tlo"] = f"G{int(g)}"
+                elif g in (17, 18, 19):
+                    out["plane"] = f"G{int(g)}"
+                elif g in (90, 91):
+                    out["dist"] = f"G{int(g)}"
+    return out
+
+
+class ProgScreen(Screen):
+    """PROG screen. Chapters depend on task_mode:
+      MANUAL: PRGRM  EDIT  DIR  USB        (EDIT-mode tree)
+      AUTO:   PRGRM  CHECK CURRNT NEXT RSTR (MEM-mode tree)
+      MDI:    PRGRM  MDI   CURRNT NEXT      (MDI-mode tree)
+    BG-EDT, C.A.P, SCHDUL and EX-EDT block ops intentionally omitted."""
+
+    LIST_ROWS = 13          # program text rows on PRGRM page
+    FILE_ROWS = 10          # rows on DIR/USB pages
+    EDIT_ROWS = 11          # rows in the editor
+
+    _CHAPTERS_BY_MODE = {
+        linuxcnc.MODE_MANUAL: ("PRGRM", "EDIT", "DIR", "USB"),
+        linuxcnc.MODE_AUTO:   ("PRGRM", "CHECK", "CURRNT", "NEXT", "RSTR"),
+        linuxcnc.MODE_MDI:    ("PRGRM", "MDI", "CURRNT", "NEXT"),
+    }
+
+    # ------------------------------------------------------------- lifecycle
+    def on_enter(self):
+        self.chapter = getattr(self, "chapter", "PRGRM")
+        self.view_line = None            # None = follow execution
+        self.check_sub = getattr(self, "check_sub", "ABS")
+        self.note = ""                   # transient feedback line
+        # editor state
+        self.edit_lines = None           # working copy while editing
+        self.edit_cur = 0
+        self.edit_scroll = 0
+        # file browser state
+        self.dir_path = getattr(self, "dir_path", None) or self.app.prog_dir
+        self.usb_path = None
+        self.entries = []
+        self.file_cur = 0
+        self.file_scroll = 0
+        # MDI history
+        if not hasattr(self, "mdi_hist"):
+            self.mdi_hist = deque(maxlen=30)
+        # RSTR state
+        self.rstr_line = None            # 1-based target line
+        self.rstr_scan = None
+        self._last_mode = self.app.stat.task_mode
+        self._enter_chapter(self.chapter)
+
+    def _valid_chapters(self):
+        return self._CHAPTERS_BY_MODE.get(self.app.stat.task_mode,
+                                          ("PRGRM",))
+
+    def _enter_chapter(self, name):
+        if name not in self._valid_chapters():
+            name = "PRGRM"
+        self.chapter = name
+        self.note = ""
+        self.cursor = None               # no FieldCursor pages here
+        if name == "EDIT":
+            self._edit_begin()
+            return                       # _edit_begin sets its own softkeys
+        if name in ("DIR", "USB"):
+            self._refresh_files()
+        self.set_root(self._root_row())
+
+    # ------------------------------------------------------------- root menu
+    def _root_row(self):
+        row = []
+        for name in self._valid_chapters():
+            row.append(K(name, lambda n=name: self._enter_chapter(n)))
+        # chapter-specific extra root keys
+        if self.chapter == "CHECK":
+            row.append(K("ABS", lambda: setattr(self, "check_sub", "ABS")))
+            row.append(K("REL", lambda: setattr(self, "check_sub", "REL")))
+        elif self.chapter == "RSTR":
+            row.append(K("SEARCH", self._rstr_search))
+            row.append(K("EXEC",   self._rstr_exec))
+            row.append(K("CAN",    self._rstr_cancel))
+        while len(row) < 9:
+            row.append(K())
+        row.append(K("(OPRT)", self._oprt))
+        return row
+
+    # ------------------------------------------------------------- OPRT
+    def _oprt(self):
+        if self.chapter == "PRGRM":
+            self.push([
+                K("O SRH", self._o_srh),
+                K("N SRH", self._n_srh),
+                K("SRH \\/", lambda: self._srh(+1)),
+                K("SRH /\\", lambda: self._srh(-1)),
+                K("REWIND", self._rewind),
+            ])
+        elif self.chapter == "MDI":
+            self.push([
+                K("EXEC",  self._mdi_exec),
+                K("CLEAR", self._mdi_clear),
+            ])
+        elif self.chapter in ("DIR", "USB"):
+            keys = [
+                K("SELECT", self._file_select),
+                K("O SRH",  self._file_o_srh),
+                K("NEW",    self._file_new),
+                K("DELETE", lambda: self._confirm(self._file_delete)),
+                K("REFRSH", self._refresh_files),
+            ]
+            if self.chapter == "USB":
+                keys.insert(3, K("READ", lambda: self._confirm(self._file_read)))
+            else:
+                keys.insert(3, K("PUNCH", lambda: self._confirm(self._file_punch)))
+            self.push(keys)
+        # CHECK/CURRNT/NEXT: nothing beyond the dropped BG-EDT
+
+    def _confirm(self, exec_fn):
+        self.push([K("CAN", self.pop),
+                   K("EXEC", lambda: (exec_fn(), self.pop()))])
+
+    # ------------------------------------------------------------- PRGRM verbs
+    def _rewind(self):
+        self.view_line = 0
+
+    def _o_srh(self):
+        """Load a program from prog_dir by O-number (matches file stem)."""
+        txt = self.app.input.take().strip().lstrip("O")
+        try:
+            n = int(txt)
+        except ValueError:
+            return
+        stems = {f"O{n}", f"O{n:04d}", f"O{n:05d}"}
+        try:
+            names = sorted(os.listdir(self.app.prog_dir))
+        except OSError:
+            self.note = "PROGRAM DIR NOT FOUND"
+            return
+        for name in names:
+            stem = os.path.splitext(name)[0].upper()
+            if stem in stems:
+                self._load(os.path.join(self.app.prog_dir, name))
+                return
+        self.note = f"O{n} NOT FOUND"
+
+    # ---- search helpers: the same verbs serve PRGRM (view cursor over the
+    # loaded program) and EDIT (line cursor over the unsaved working copy)
+    def _in_editor(self):
+        return self.chapter == "EDIT" and self.edit_lines is not None
+
+    def _search_lines(self):
+        return self.edit_lines if self._in_editor() else self.app.ndisp.lines()
+
+    def _search_start(self):
+        if self._in_editor():
+            return self.edit_cur
+        st = self.app.stat
+        return (self.view_line if self.view_line is not None
+                else max(0, (st.motion_line or st.current_line) - 1))
+
+    def _search_goto(self, i):
+        if self._in_editor():
+            self.edit_cur = i
+            self.edit_word = 0          # land on the first word of the hit
+            self._clamp_word()
+        else:
+            self.view_line = i
+
+    def _n_srh(self):
+        txt = self.app.input.take().strip().lstrip("N")
+        try:
+            n = int(txt)
+        except ValueError:
+            return
+        pat = re.compile(rf'[Nn]0*{n}\b')
+        for i, line in enumerate(self._search_lines()):
+            if pat.search(line):
+                self._search_goto(i)
+                return
+        self.note = f"N{n} NOT FOUND"
+
+    def _srh(self, direction):
+        """Address search: find buffer text below/above the current line."""
+        pat = self.app.input.take().strip()
+        if not pat:
+            return
+        lines = self._search_lines()
+        start = self._search_start()
+        rng = (range(start + 1, len(lines)) if direction > 0
+               else range(start - 1, -1, -1))
+        for i in rng:
+            if pat in lines[i].upper():
+                self._search_goto(i)
+                return
+        self.note = f"{pat} NOT FOUND"
+
+    def _load(self, path):
+        try:
+            self.app.reload_program(path)
+            self.view_line = 0
+            self.note = f"LOADED {os.path.basename(path)}"
+        except linuxcnc.error as e:
+            self.note = str(e)
+
+    # ------------------------------------------------------------- editor
+    def _edit_begin(self):
+        st = self.app.stat
+        if st.interp_state != linuxcnc.INTERP_IDLE:
+            self.note = "CANNOT EDIT WHILE RUNNING"
+            self.chapter = "PRGRM"
+            self.set_root(self._root_row())
+            return
+        if not st.file:
+            self.note = "NO PROGRAM LOADED"
+            self.chapter = "PRGRM"
+            self.set_root(self._root_row())
+            return
+        try:
+            with open(st.file) as f:
+                self.edit_lines = [l.rstrip("\n") for l in f.readlines()]
+        except OSError:
+            self.edit_lines = []
+        if not self.edit_lines:
+            self.edit_lines = [""]
+        self.edit_cur = 0
+        self.edit_word = 0
+        self.edit_scroll = 0
+        self.set_root([
+            K("INSERT",  self._edit_insert_word),
+            K("ALTER",   self._edit_alter),
+            K("DEL.WRD", self._edit_delete_word),
+            K("ALT.LIN", self._edit_alter_line),
+            K("DEL.LIN", self._edit_delete_line),
+            K("N SRH",   self._n_srh),
+            K("SRH \\/", lambda: self._srh(+1)),
+            K("SRH /\\", lambda: self._srh(-1)),
+            K("SAVE",   lambda: self._confirm(self._edit_save)),
+            K("CANCEL", self._edit_cancel),
+        ])
+
+    def _edit_words(self):
+        """[(start, end)] spans of whitespace-separated words on the
+        cursored line."""
+        line = self.edit_lines[self.edit_cur]
+        return [(m.start(), m.end()) for m in re.finditer(r'\S+', line)]
+
+    def _clamp_word(self):
+        n = len(self._edit_words())
+        self.edit_word = max(0, min(self.edit_word, max(0, n - 1)))
+
+    def _edit_insert_word(self):
+        """INSERT: buffer text becomes new word(s) AFTER the selected word
+        (start of line if the line is empty)."""
+        text = space_words(self.app.input.take()).strip()
+        if not text:
+            return
+        line = self.edit_lines[self.edit_cur]
+        words = self._edit_words()
+        if not words:
+            self.edit_lines[self.edit_cur] = text
+            self.edit_word = 0
+        else:
+            _s, end = words[self.edit_word]
+            new = line[:end] + " " + text + line[end:]
+            self.edit_lines[self.edit_cur] = re.sub(r'[ \t]+', ' ', new).strip()
+            self.edit_word += 1
+        self._clamp_word()
+
+    def _edit_alter(self):
+        """ALTER: replace the selected word with the buffer text."""
+        text = space_words(self.app.input.take()).strip()
+        words = self._edit_words()
+        if not text or not words:
+            return
+        s, e = words[self.edit_word]
+        line = self.edit_lines[self.edit_cur]
+        self.edit_lines[self.edit_cur] = line[:s] + text + line[e:]
+
+    def _edit_delete_word(self):
+        """DEL.WRD: remove the selected word."""
+        words = self._edit_words()
+        if not words:
+            return
+        s, e = words[self.edit_word]
+        line = self.edit_lines[self.edit_cur]
+        self.edit_lines[self.edit_cur] = re.sub(r'[ \t]+', ' ',
+                                                line[:s] + line[e:]).strip()
+        self._clamp_word()
+
+    def _edit_alter_line(self):
+        """ALT.LIN: replace the whole cursored line with the buffer text."""
+        self.edit_lines[self.edit_cur] = space_words(self.app.input.take())
+        self.edit_word = 0
+
+    def _edit_insert(self):
+        """RETURN key: buffer text becomes a new LINE after the cursored one."""
+        text = space_words(self.app.input.take())
+        self.edit_lines.insert(self.edit_cur + 1, text)
+        self.edit_cur += 1
+        self.edit_word = 0
+
+    def _edit_delete_line(self):
+        if self.edit_lines:
+            self.edit_lines.pop(self.edit_cur)
+        if not self.edit_lines:
+            self.edit_lines = [""]
+        self.edit_cur = min(self.edit_cur, len(self.edit_lines) - 1)
+        self._clamp_word()
+
+    def _edit_save(self):
+        path = self.app.stat.file
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(self.edit_lines) + "\n")
+        except OSError as e:
+            self.note = f"SAVE FAILED: {e}"
+            return
+        self.edit_lines = None
+        self.app.reload_program(path)
+        self.note = "SAVED"
+        self._enter_chapter("PRGRM")
+
+    def _edit_cancel(self):
+        self.edit_lines = None
+        self._enter_chapter("PRGRM")
+
+    def edit_key(self, action):
+        """Physical ALTER/INSERT/DELETE keys — active only in EDIT."""
+        if self.chapter != "EDIT" or self.edit_lines is None:
+            return
+        if action == "ALTER":
+            self._edit_alter()
+        elif action == "INSERT":
+            self._edit_insert_word()
+        elif action == "DELETE":
+            self._edit_delete_word()
+
+    # ------------------------------------------------------------- MDI
+    def _mdi_exec(self):
+        cmd = space_words(self.app.input.take().strip())
+        if not cmd:
+            return
+        st = self.app.stat
+        if st.estop or st.task_state != linuxcnc.STATE_ON:
+            self.note = "MACHINE NOT READY"
+            return
+        try:
+            self.app.mdi(cmd)
+            self.mdi_hist.appendleft(cmd)
+        except linuxcnc.error as e:
+            self.note = str(e)
+
+    def _mdi_clear(self):
+        self.mdi_hist.clear()
+
+    # ------------------------------------------------------------- RSTR
+    def _rstr_search(self):
+        """Type N-number (N100) or raw line number (100); scan modals up to it."""
+        txt = self.app.input.take().strip()
+        lines = self.app.ndisp.lines()
+        if not lines:
+            self.note = "NO PROGRAM LOADED"
+            return
+        target = None
+        if txt[:1].upper() == "N":
+            try:
+                n = int(txt[1:])
+            except ValueError:
+                return
+            pat = re.compile(rf'[Nn]0*{n}\b')
+            for i, line in enumerate(lines):
+                if pat.search(line):
+                    target = i + 1
+                    break
+            if target is None:
+                self.note = f"N{n} NOT FOUND"
+                return
+        else:
+            try:
+                target = int(txt)
+            except ValueError:
+                return
+            if not (1 <= target <= len(lines)):
+                self.note = "LINE OUT OF RANGE"
+                return
+        self.rstr_line = target
+        self.rstr_scan = scan_modals(lines, target - 1)
+
+    def _rstr_exec(self):
+        """Run from the scanned line. NOTE: LinuxCNC does not execute M/S/T
+        on the way — re-establish tool/spindle/coolant via MDI first."""
+        if self.rstr_line is None:
+            self.note = "SEARCH A LINE FIRST"
+            return
+        if self.rstr_scan and self.rstr_scan["oword"]:
+            self.note = "RESTART INTO SUB - NOT SUPPORTED"
+            return
+        st = self.app.stat
+        if st.estop or st.task_state != linuxcnc.STATE_ON:
+            self.note = "MACHINE NOT READY"
+            return
+        c = self.app.command
+        c.mode(linuxcnc.MODE_AUTO)
+        c.wait_complete()
+        c.auto(linuxcnc.AUTO_RUN, self.rstr_line)
+
+    def _rstr_cancel(self):
+        self.rstr_line = None
+        self.rstr_scan = None
+
+    # ------------------------------------------------------------- files
+    def _roots(self):
+        if self.chapter == "USB":
+            for m in self.app.usb_mounts:
+                if os.path.isdir(m):
+                    return m
+            return None
+        return self.app.prog_dir
+
+    def _refresh_files(self):
+        root = self._roots()
+        self.entries = []
+        self.file_cur = 0
+        self.file_scroll = 0
+        if root is None:
+            self.note = "NO USB MOUNTED"
+            self.set_root(self._root_row())
+            return
+        base = self.usb_path if self.chapter == "USB" else self.dir_path
+        if not base or not base.startswith(root):
+            base = root
+        try:
+            names = sorted(os.listdir(base), key=str.upper)
+        except OSError:
+            base = root
+            try:
+                names = sorted(os.listdir(base), key=str.upper)
+            except OSError:
+                names = []
+        if base != root:
+            self.entries.append(("..", True, os.path.dirname(base)))
+        for n in names:
+            if n.startswith("."):
+                continue
+            p = os.path.join(base, n)
+            self.entries.append((n, os.path.isdir(p), p))
+        # dirs first, both halves alphabetical
+        self.entries.sort(key=lambda e: (e[0] != "..", not e[1], e[0].upper()))
+        if self.chapter == "USB":
+            self.usb_path = base
+        else:
+            self.dir_path = base
+        self.set_root(self._root_row())
+
+    def _cur_entry(self):
+        return self.entries[self.file_cur] if self.entries else None
+
+    def _file_select(self):
+        e = self._cur_entry()
+        if not e:
+            return
+        name, is_dir, path = e
+        if is_dir:
+            if self.chapter == "USB":
+                self.usb_path = path
+            else:
+                self.dir_path = path
+            self._refresh_files()
+        else:
+            self._load(path)
+
+    def _file_o_srh(self):
+        txt = self.app.input.take().strip().lstrip("O")
+        try:
+            n = int(txt)
+        except ValueError:
+            return
+        stems = {f"O{n}", f"O{n:04d}", f"O{n:05d}"}
+        for i, (name, is_dir, _p) in enumerate(self.entries):
+            if not is_dir and os.path.splitext(name)[0].upper() in stems:
+                self.file_cur = i
+                return
+        self.note = f"O{n} NOT FOUND"
+
+    def _file_new(self):
+        """Buffer = program name (O0100 or alphanumeric); creates <name>.ngc."""
+        name = self.app.input.take().strip()
+        if not name:
+            return
+        name = re.sub(r'[^\w.-]', '_', name)
+        if not name.upper().endswith(".NGC"):
+            name += ".ngc"
+        base = self.usb_path if self.chapter == "USB" else self.dir_path
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            self.note = "ALREADY EXISTS"
+            return
+        try:
+            with open(path, "w") as f:
+                f.write("( NEW PROGRAM )\nM2\n")
+        except OSError as e:
+            self.note = f"CREATE FAILED: {e}"
+            return
+        self._refresh_files()
+        self.note = f"CREATED {name}"
+
+    def _file_delete(self):
+        e = self._cur_entry()
+        if not e or e[1]:                # never delete directories
+            return
+        try:
+            os.remove(e[2])
+            self.note = f"DELETED {e[0]}"
+        except OSError as err:
+            self.note = f"DELETE FAILED: {err}"
+        self._refresh_files()
+
+    def _file_read(self):
+        """USB page: copy cursored file USB -> program directory."""
+        e = self._cur_entry()
+        if not e or e[1]:
+            return
+        dst = os.path.join(self.app.prog_dir, e[0])
+        try:
+            shutil.copy(e[2], dst)
+            self.note = f"READ {e[0]} -> DIR"
+        except OSError as err:
+            self.note = f"READ FAILED: {err}"
+
+    def _file_punch(self):
+        """DIR page: copy cursored file program directory -> first USB."""
+        e = self._cur_entry()
+        if not e or e[1]:
+            return
+        usb = None
+        for m in self.app.usb_mounts:
+            if os.path.isdir(m):
+                usb = m
+                break
+        if usb is None:
+            self.note = "NO USB MOUNTED"
+            return
+        try:
+            shutil.copy(e[2], os.path.join(usb, e[0]))
+            self.note = f"PUNCH {e[0]} -> USB"
+        except OSError as err:
+            self.note = f"PUNCH FAILED: {err}"
+
+    # ------------------------------------------------------------- keys
+    def on_key(self, sc):
+        ch = self.chapter
+        if ch == "EDIT" and self.edit_lines is not None:
+            if sc == SDL_SCANCODE_UP:
+                self.edit_cur = max(0, self.edit_cur - 1)
+                self._clamp_word(); return True
+            if sc == SDL_SCANCODE_DOWN:
+                self.edit_cur = min(len(self.edit_lines) - 1,
+                                    self.edit_cur + 1)
+                self._clamp_word(); return True
+            if sc == SDL_SCANCODE_LEFT:
+                self.edit_word = max(0, self.edit_word - 1); return True
+            if sc == SDL_SCANCODE_RIGHT:
+                self.edit_word += 1
+                self._clamp_word(); return True
+            if sc == SDL_SCANCODE_PAGEUP:
+                self.edit_cur = max(0, self.edit_cur - self.EDIT_ROWS)
+                self._clamp_word(); return True
+            if sc == SDL_SCANCODE_PAGEDOWN:
+                self.edit_cur = min(len(self.edit_lines) - 1,
+                                    self.edit_cur + self.EDIT_ROWS)
+                self._clamp_word(); return True
+            if sc == SDL_SCANCODE_RETURN:
+                self._edit_insert(); return True
+        elif ch in ("DIR", "USB"):
+            if sc == SDL_SCANCODE_UP:
+                self.file_cur = max(0, self.file_cur - 1); return True
+            if sc == SDL_SCANCODE_DOWN:
+                self.file_cur = min(max(0, len(self.entries) - 1),
+                                    self.file_cur + 1); return True
+            if sc == SDL_SCANCODE_PAGEUP:
+                self.file_cur = max(0, self.file_cur - self.FILE_ROWS)
+                return True
+            if sc == SDL_SCANCODE_PAGEDOWN:
+                self.file_cur = min(max(0, len(self.entries) - 1),
+                                    self.file_cur + self.FILE_ROWS)
+                return True
+            if sc == SDL_SCANCODE_RETURN:
+                self._file_select(); return True
+        elif ch == "MDI":
+            if sc == SDL_SCANCODE_RETURN:
+                self._mdi_exec(); return True
+        elif ch == "PRGRM":
+            lines = self.app.ndisp.lines()
+            st = self.app.stat
+            def base():
+                if self.view_line is not None:
+                    return self.view_line
+                return max(0, (st.motion_line or st.current_line) - 3)
+            if sc == SDL_SCANCODE_UP and self.view_line is not None:
+                self.view_line = max(0, self.view_line - 1); return True
+            if sc == SDL_SCANCODE_DOWN and self.view_line is not None:
+                self.view_line = min(max(0, len(lines) - 1),
+                                     self.view_line + 1); return True
+            if sc == SDL_SCANCODE_PAGEUP:
+                self.view_line = max(0, base() - self.LIST_ROWS); return True
+            if sc == SDL_SCANCODE_PAGEDOWN:
+                self.view_line = min(max(0, len(lines) - 1),
+                                     base() + self.LIST_ROWS); return True
+        return super().on_key(sc)
+
+    # ------------------------------------------------------------- draw
+    def draw(self, renderer, area):
+        # rebuild chapter row if the mode dial moved (physical switch)
+        mode = self.app.stat.task_mode
+        if mode != self._last_mode:
+            self._last_mode = mode
+            if self.chapter == "EDIT" and self.edit_lines is not None:
+                self.edit_lines = None           # discard edits on mode change
+            self._enter_chapter(self.chapter)    # revalidates against new mode
+
+        f = self.app.font
+        ch = self.chapter
+        if ch == "PRGRM":
+            self._draw_prgrm(renderer, f)
+        elif ch == "CHECK":
+            self._draw_check(renderer, f)
+        elif ch == "CURRNT":
+            self._draw_block(renderer, f, 0, "CURRENT BLOCK")
+        elif ch == "NEXT":
+            self._draw_block(renderer, f, 1, "NEXT BLOCK")
+        elif ch == "MDI":
+            self._draw_mdi(renderer, f)
+        elif ch == "RSTR":
+            self._draw_rstr(renderer, f)
+        elif ch == "EDIT":
+            self._draw_edit(renderer, f)
+        elif ch in ("DIR", "USB"):
+            self._draw_files(renderer, f)
+        if self.note:
+            draw_line(renderer, f, self.note, 10, SOFTKEY_Y - BUFFER_H - 120, RED)
+
+    def _hilite_row(self, renderer, f, text, x, y, w, active):
+        if active:
+            SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+            SDL_RenderFillRect(renderer, SDL_Rect(x - 4, y - 2, w, 56))
+            draw_line(renderer, f, text, x, y, BLACK)
+        else:
+            draw_line(renderer, f, text, x, y)
+
+    def _draw_prgrm(self, renderer, f):
+        st = self.app.stat
+        draw_line(renderer, f, os.path.basename(st.file) if st.file
+                  else "(no program loaded)", 10, 70)
+        lines = self.app.ndisp.lines()
+        if not lines:
+            return
+        cur = st.motion_line or st.current_line
+        executing = cur > 0 and st.interp_state != linuxcnc.INTERP_IDLE
+        if executing or self.view_line is None:
+            first = max(0, cur - 3)
+        else:
+            first = self.view_line
+        first = max(0, min(first, max(0, len(lines) - self.LIST_ROWS)))
+        for row, idx in enumerate(range(first,
+                                        min(len(lines), first + self.LIST_ROWS))):
+            color = RED if (idx + 1) == cur and cur > 0 else WHITE
+            draw_line(renderer, f, f"{idx + 1:4d} {lines[idx].rstrip()}",
+                      10, 130 + row * 55, color)
+
+    def _draw_check(self, renderer, f):
+        st = self.app.stat
+        app = self.app
+        draw_line(renderer, f, f"PROGRAM CHECK  ({self.check_sub})", 10, 70)
+        lines = self.app.ndisp.lines()
+        cur = st.motion_line or st.current_line
+        if lines:
+            first = max(0, cur - 2)
+            for row, idx in enumerate(range(first, min(len(lines), first + 5))):
+                color = RED if (idx + 1) == cur and cur > 0 else WHITE
+                draw_line(renderer, f, lines[idx].rstrip(), 10, 130 + row * 55, color)
+        y = 430
+        # position (ABS/REL per toggle) left, DTG right
+        draw_line(renderer, f, self.check_sub, 10, y)
+        draw_line(renderer, f, "DIST TO GO", 740, y)
+        y += 60
+        for r, ax in enumerate(app.axes):
+            idx = AXIS_IDX[ax]
+            if self.check_sub == "ABS":
+                v = (st.actual_position[idx] - st.g5x_offset[idx]
+                     - st.g92_offset[idx] - st.tool_offset[idx])
+            else:
+                v = st.actual_position[idx] - app.rel_origin[idx]
+            draw_line(renderer, f, f"{ax} {app.fmt_axis(ax, v)}", 10, y + r * 52)
+            draw_line(renderer, f, f"{ax} {app.fmt_axis(ax, st.dtg[idx])}",
+                      740, y + r * 52)
+
+    def _draw_block(self, renderer, f, offset, title):
+        """offset 0 = executing block, 1 = next physical block."""
+        st = self.app.stat
+        draw_line(renderer, f, title, 10, 70)
+        lines = self.app.ndisp.lines()
+        cur = st.motion_line or st.current_line
+        idx = cur - 1 + offset
+        if lines and 0 <= idx < len(lines):
+            # the block's words, one per row
+            words = re.findall(r'[A-Za-z][+-]?[\d.]*', lines[idx])
+            for r, w in enumerate(words[:10]):
+                draw_line(renderer, f, w, 10, 140 + r * 55)
+            draw_line(renderer, f, lines[idx].strip(), 400, 140, RED)
+        # live modal state (from stat, not the text scan)
+        codes = []
+        for v in st.gcodes[1:]:
+            if v != -1:
+                codes.append(f"G{v // 10}" + (f".{v % 10}" if v % 10 else ""))
+        for v in st.mcodes[1:]:
+            if v != -1:
+                codes.append(f"M{v}")
+        draw_line(renderer, f, "MODAL", 740, 140)
+        for j in range(0, len(codes), 4):
+            draw_line(renderer, f, " ".join(codes[j:j + 4]),
+                      740, 200 + (j // 4) * 50, SDL_Color(150, 150, 150))
+
+    def _draw_mdi(self, renderer, f):
+        draw_line(renderer, f, "MDI  (type block, EXEC or ENTER to run)", 10, 70)
+        st = self.app.stat
+        if st.interp_state != linuxcnc.INTERP_IDLE:
+            draw_line(renderer, f, "EXECUTING...", 10, 140, RED)
+        if self.app.show_mdi_history:
+            y = 200
+            for cmd in list(self.mdi_hist)[:12]:
+                draw_line(renderer, f, cmd, 10, y, SDL_Color(150, 150, 150))
+                y += 52
+
+    def _draw_rstr(self, renderer, f):
+        draw_line(renderer, f, "PROGRAM RESTART", 10, 70)
+        draw_line(renderer, f,
+                  "TYPE N-NUMBER (N100) OR LINE (100), THEN [SEARCH]", 10, 130)
+        if self.rstr_line is None:
+            return
+        lines = self.app.ndisp.lines()
+        y = 210
+        draw_line(renderer, f, f"TARGET LINE {self.rstr_line}:", 10, y)
+        if 0 < self.rstr_line <= len(lines):
+            draw_line(renderer, f, lines[self.rstr_line - 1].strip(),
+                      420, y, RED)
+        y += 70
+        s = self.rstr_scan
+        rows = [
+            ("TOOL",    f"T{s['T']}" if s['T'] is not None else "-"),
+            ("SPINDLE", f"{s['spindle']}"
+                        + (f"  S{s['S']:g}" if s['S'] else "")),
+            ("FEED",    f"F{s['F']:g}" if s['F'] else "-"),
+            ("COOLANT", s["coolant"]),
+            ("MODALS",  " ".join(x for x in (s["units"], s["wcs"], s["tlo"],
+                                             s["plane"], s["dist"]) if x)),
+        ]
+        for label, val in rows:
+            draw_line(renderer, f, f"{label:<9} {val}", 10, y)
+            y += 55
+        y += 20
+        if s["oword"]:
+            draw_line(renderer, f, "!! SUB/LOOP BEFORE TARGET - EXEC BLOCKED",
+                      10, y, RED)
+        else:
+            draw_line(renderer, f,
+                      "RE-ESTABLISH T/S/COOLANT VIA MDI, THEN [EXEC]", 10, y, RED)
+
+    def _draw_edit(self, renderer, f):
+        st = self.app.stat
+        draw_line(renderer, f,
+                  f"EDIT  {os.path.basename(st.file)}", 10, 70)
+        if self.edit_lines is None:
+            return
+        # keep cursor visible
+        if self.edit_cur < self.edit_scroll:
+            self.edit_scroll = self.edit_cur
+        elif self.edit_cur >= self.edit_scroll + self.EDIT_ROWS:
+            self.edit_scroll = self.edit_cur - self.EDIT_ROWS + 1
+        for row, idx in enumerate(range(self.edit_scroll,
+                                        min(len(self.edit_lines),
+                                            self.edit_scroll + self.EDIT_ROWS))):
+            line = self.edit_lines[idx]
+            prefix = f"{idx + 1:4d} "
+            y = 130 + row * 55
+            draw_line(renderer, f, prefix + line, 10, y)
+            if idx != self.edit_cur:
+                continue
+            # highlight the selected WORD on the cursored line
+            spans = [(m.start(), m.end())
+                     for m in re.finditer(r'\S+', line)]
+            if spans:
+                self._clamp_word()
+                s, e = spans[self.edit_word]
+                x0 = 10 + text_width(f, prefix + line[:s])
+                wpx = text_width(f, line[s:e])
+                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+                SDL_RenderFillRect(renderer,
+                                   SDL_Rect(x0 - 3, y - 2, wpx + 6, 56))
+                draw_line(renderer, f, line[s:e], x0, y, BLACK)
+            else:
+                # empty line: block cursor at the insert position
+                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+                SDL_RenderFillRect(renderer,
+                                   SDL_Rect(10 + text_width(f, prefix),
+                                            y - 2, 26, 56))
+
+    def _draw_files(self, renderer, f):
+        base = self.usb_path if self.chapter == "USB" else self.dir_path
+        draw_line(renderer, f, f"{self.chapter}  {base or '-'}", 10, 70)
+        if not self.entries:
+            draw_line(renderer, f, "(empty)", 10, 130)
+            return
+        if self.file_cur < self.file_scroll:
+            self.file_scroll = self.file_cur
+        elif self.file_cur >= self.file_scroll + self.FILE_ROWS:
+            self.file_scroll = self.file_cur - self.FILE_ROWS + 1
+        for row, idx in enumerate(range(self.file_scroll,
+                                        min(len(self.entries),
+                                            self.file_scroll + self.FILE_ROWS))):
+            name, is_dir, path = self.entries[idx]
+            if is_dir:
+                text = f"<DIR>  {name}"
+            else:
+                try:
+                    size = os.path.getsize(path)
+                    text = f"{size // 1024:5d}K  {name}" if size >= 1024 \
+                           else f"{size:5d}B  {name}"
+                except OSError:
+                    text = f"    ?  {name}"
+            self._hilite_row(renderer, f, text, 10, 130 + row * 60, 1300,
+                             idx == self.file_cur)
+
+
+class OffsetScreen(Screen):
+    """OFFSET/SETTING chapter: [OFFSET] [SETING] [WORK] (+PROBE pages)."""
+
+    VISIBLE_ROWS = 9
+    ROW_H = 74
+    TABLE_Y = 200
+    WCOL_X0, WCOL_W, WCOL_PITCH = 170, 240, 256
+    UNIT_CYCLE = ("MACHINE", "MM", "INCH", "PROGRAM")
+
+    # ------------------------------------------------------------- lifecycle
+    def on_enter(self):
+        self.chapter = getattr(self, "chapter", "OFFSET")
+        self.sub = getattr(self, "sub", "GEOM")          # WEAR | GEOM
+        self.scroll = 0
+        self.wear = self._load_wear()
+        self.comments = self._read_tool_comments()
+        self.wcs_vals = self._read_var_wcs()
+        self._enter_chapter(self.chapter)
+
+    # ------------------------------------------------------------- root menu
+    def _root_row(self, extra=None):
+        row = [
+            K("OFFSET", lambda: self._enter_chapter("OFFSET")),
+            K("SETING", lambda: self._enter_chapter("SETING")),
+            K("WORK",   lambda: self._enter_chapter("WORK")),
+        ]
+        row += extra or []
+        while len(row) < 9:
+            row.append(K())
+        row.append(K("(OPRT)", self._oprt))
+        return row
+
+    def _enter_chapter(self, name):
+        self.chapter = name
+        if name == "OFFSET":
+            self.set_root(self._root_row([
+                K("WEAR", lambda: self._set_sub("WEAR")),
+                K("GEOM", lambda: self._set_sub("GEOM")),
+                K("PROBE", lambda: self._enter_chapter("TPROBE")),
+            ]))
+            self._build_tool_cursor()
+        elif name == "SETING":
+            self.set_root(self._root_row())
+            self._build_setting_cursor()
+        elif name == "WORK":
+            self.wcs_vals = self._read_var_wcs()
+            self.set_root(self._root_row([
+                K("PROBE", lambda: self._enter_chapter("WPROBE")),
+            ]))
+            self._build_work_cursor()
+        elif name == "TPROBE":
+            self.cursor = FieldCursor(cols=1)
+            self.cursor.add(0, 0, 200, 56,
+                setter=lambda t: self._pset_val("zero_height", t))
+            self.set_root([
+                K("Z.PRB", lambda: self._confirm(self._tprobe_exec)),
+                K(), K(), K(), K(), K(), K(), K(),
+                K("RETURN", lambda: self._enter_chapter("OFFSET")),
+                K(),
+            ])
+        elif name == "WPROBE":
+            self._enter_chapter("POUT")
+        elif name in PROBE_PAGES:
+            self._build_probe_grid()
+            row = [K(lbl, lambda n=pg: self._enter_chapter(n))
+                   for pg, lbl in PROBE_PAGE_KEYS]      # six page keys
+            row += [K("P.SET", lambda: self._enter_chapter("PSET")),
+                    K("EXEC", lambda: self._confirm(self._wprobe_exec)),
+                    K(),
+                    K("RETURN", lambda: self._enter_chapter("WORK"))]
+            self.set_root(row)
+        elif name == "PSET":
+            self._build_pset_cursor()
+            self.set_root([
+                K("INPUT", lambda: self.cursor.commit(self.app.input.take())),
+                K(), K(), K(), K(), K(), K(), K(),
+                K("RETURN", lambda: self._enter_chapter("POUT")),
+                K(),
+            ])
+
+    def _set_sub(self, sub):
+        self.sub = sub
+        self._build_tool_cursor()
+
+    # ------------------------------------------------------------- OPRT menus
+    def _oprt(self):
+        if self.chapter == "OFFSET":
+            page1 = [
+                K("NO.SRH", self._no_srh),
+                K("MEASUR", self._tool_measure),
+                K("INP.C.", self._input_counter),
+                K("+INPUT", lambda: self.cursor.commit_add(self.app.input.take())),
+                K("INPUT",  lambda: self.cursor.commit(self.app.input.take())),
+            ]
+            page2 = [
+                K("CLEAR", self._clear_menu),
+                K("READ",  lambda: self._confirm(self._read_exec)),
+                K("PUNCH", lambda: self._confirm(self._punch_exec)),
+            ]
+            self.push([page1, page2])
+        elif self.chapter == "SETING":
+            self.push([
+                K("INPUT", lambda: self.cursor.commit(self.app.input.take() or " ")),
+            ])
+        elif self.chapter == "WORK":
+            self.push([
+                K("NO.SRH", self._no_srh),
+                K("MEASUR", self._work_measure),
+                K("+INPUT", lambda: self.cursor.commit_add(self.app.input.take())),
+                K("INPUT",  lambda: self.cursor.commit(self.app.input.take())),
+            ])
+
+    def _clear_menu(self):
+        self.push([
+            K("ALL",  lambda: self._clear("ALL")),
+            K("WEAR", lambda: self._clear("WEAR")),
+            K("GEOM", lambda: self._clear("GEOM")),
+        ])
+
+    def _confirm(self, exec_fn):
+        self.push([K("CAN", self.pop), K("EXEC", lambda: (exec_fn(), self.pop()))])
+
+    # ------------------------------------------------------------- tool data
+    # Internal wear/geom values are MACHINE units; conversion only at the
+    # MDI strings (interp units) and the display/entry membrane.
+    _T_RE = re.compile(r'^\s*[Tt](\d+)\b')
+
+    def _tools(self):
+        # real entries only: skip index 0 spindle slot, id -1 empties
+        return [t for t in self.app.stat.tool_table[1:] if t.id > 0]
+
+    def _tool_tbl_path(self):
+        try:
+            ini = linuxcnc.ini(self.app.stat.ini_filename)
+            tbl = ini.find("EMCIO", "TOOL_TABLE") or "tool.tbl"
+        except linuxcnc.error:
+            tbl = "tool.tbl"
+        return os.path.join(os.path.dirname(self.app.stat.ini_filename), tbl)
+
+    def _read_tool_comments(self):
+        """{tool_id: comment} from the .tbl (text after ';' on each T line)."""
+        out = {}
+        try:
+            with open(self._tool_tbl_path()) as f:
+                for line in f:
+                    m = self._T_RE.match(line)
+                    if m and ";" in line:
+                        out[int(m.group(1))] = line.split(";", 1)[1].strip()
+        except OSError:
+            pass
+        return out
+
+    def _set_tool_comment(self, tid, text):
+        """Rewrite the ;comment on tool tid's .tbl line, then reload so
+        LinuxCNC's in-memory copy carries it (its own G10-triggered rewrites
+        preserve the comment field)."""
+        path = self._tool_tbl_path()
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+            for i, line in enumerate(lines):
+                m = self._T_RE.match(line)
+                if m and int(m.group(1)) == tid:
+                    base = line.split(";", 1)[0].rstrip()
+                    t = text.strip()
+                    lines[i] = (f"{base} ;{t}\n" if t else base + "\n")
+                    break
+            with open(path, "w") as f:
+                f.writelines(lines)
+        except OSError as e:
+            self.app.alarms.active.appendleft({
+                "time": "", "text": f"TOOL.TBL WRITE FAILED: {e}",
+                "alarm": True})
+            return
+        self.app.command.load_tool_table()
+        self.comments = self._read_tool_comments()
+
+    def _load_wear(self):
+        try:
+            with open(WEAR_FILE) as f:
+                return {int(k): v for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_wear(self):
+        with open(WEAR_FILE, "w") as f:
+            json.dump(self.wear, f, indent=1)
+
+    def _wear_of(self, tid):
+        return self.wear.setdefault(tid, {"Z": 0.0, "R": 0.0})
+
+    def _geom_of(self, tid):
+        # LinuxCNC stores geom+wear combined (we wrote it), so geom = stored - wear
+        for t in self.app.stat.tool_table:
+            if t.id == tid:
+                w = self._wear_of(tid)
+                return {"Z": t.zoffset - w["Z"], "R": t.diameter / 2 - w["R"]}
+        return {"Z": 0.0, "R": 0.0}
+
+    def _write_tool(self, tid):
+        g, w = self._geom_of(tid), self._wear_of(tid)
+        z = self.app.machine_to_interp(g['Z'] + w['Z'])
+        r = self.app.machine_to_interp(g['R'] + w['R'])
+        self.app.mdi(f"G10 L1 P{tid} Z{z:.4f} R{r:.4f}")
+        self.app.command.load_tool_table()
+
+    def _set_tool_val(self, tid, col, text, table):
+        """Cursor/INPUT path: text is display units."""
+        try:
+            typed = float(text)
+        except ValueError:
+            return
+        self._set_tool_machine(tid, col,
+                               self.app.disp_to_machine("Z", typed), table)
+
+    def _set_tool_machine(self, tid, col, val, table):
+        """Machine-units entry point (MEASUR and probe cycles)."""
+        axis = "Z" if col == 0 else "R"
+        if table == "WEAR":
+            self._wear_of(tid)[axis] = val
+            self._save_wear()
+            self._write_tool(tid)
+        else:                                   # GEOM: adjust so geom == val
+            w = self._wear_of(tid)[axis]
+            mdi_val = self.app.machine_to_interp(val + w)
+            self.app.mdi(f"G10 L1 P{tid} {axis}{mdi_val:.4f}")
+            self.app.command.load_tool_table()
+
+    def _get_tool_val(self, tid, col, table):
+        """Machine units."""
+        axis = "Z" if col == 0 else "R"
+        return (self._wear_of(tid) if table == "WEAR" else self._geom_of(tid))[axis]
+
+    def _build_tool_cursor(self):
+        self.cursor = FieldCursor(cols=3)
+        for t in self._tools():
+            for col in (0, 1):
+                self.cursor.add(0, 0, 300, 64,     # rects positioned at draw time
+                    setter=lambda s, tid=t.id, c=col: self._set_tool_val(
+                        tid, c, s, self.sub),
+                    getter=lambda tid=t.id, c=col: self.app.machine_to_disp(
+                        "Z", self._get_tool_val(tid, c, self.sub)))
+            # comment column: setter only (no getter -> +INPUT safely no-ops)
+            self.cursor.add(0, 0, 420, 64,
+                setter=lambda s, tid=t.id: self._set_tool_comment(tid, s))
+
+    # ------------------------------------------------------------- settings
+    def _build_setting_cursor(self):
+        self.cursor = FieldCursor(cols=1)
+        self.cursor.add(0, 0, 900, 60, setter=self._set_units)
+
+    def _set_units(self, text):
+        t = text.strip().upper()
+        if t in self.UNIT_CYCLE:
+            self.app.display_units = t
+        else:                                    # any other commit = cycle
+            i = self.UNIT_CYCLE.index(self.app.display_units)
+            self.app.display_units = self.UNIT_CYCLE[(i + 1) % 4]
+        self.app.save_persist()
+
+    # ------------------------------------------------------------- work data
+    def _read_var_wcs(self):
+        """All nine systems from the var file: {sys_index: {axis: val}}.
+        Machine units. Read on page entry only; edits update locally."""
+        out = {i: {ax: 0.0 for ax in "XYZABC"} for i in range(9)}
+        try:
+            ini = linuxcnc.ini(self.app.stat.ini_filename)
+            var = ini.find("RS274NGC", "PARAMETER_FILE") or "linuxcnc.var"
+            var = os.path.join(os.path.dirname(self.app.stat.ini_filename), var)
+            params = {}
+            with open(var) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        params[int(parts[0])] = float(parts[1])
+            for s in range(9):
+                base = WCS_PARAM_BASE + 20 * s
+                for ax, off in (("X", 0), ("Y", 1), ("Z", 2),
+                                ("A", 3), ("B", 4), ("C", 5)):
+                    out[s][ax] = params.get(base + off, 0.0)
+        except (OSError, ValueError):
+            pass
+        return out
+
+    def _set_wcs(self, sys_idx, ax, text):
+        try:
+            typed = float(text)
+        except ValueError:
+            return
+        machine_val = self.app.disp_to_machine(ax, typed)
+        mdi_val = (self.app.machine_to_interp(machine_val)
+                   if ax in self.app.LINEAR_AXES else machine_val)
+        self.app.mdi(f"G10 L2 P{sys_idx + 1} {ax}{mdi_val:.4f}")
+        self.wcs_vals[sys_idx][ax] = machine_val       # store machine units
+
+    def _build_work_cursor(self):
+        axes = self.app.axes
+        self.cursor = FieldCursor(cols=len(axes))
+        for s in range(9):
+            for ax in axes:
+                self.cursor.add(0, 0, self.WCOL_W, 56,
+                    setter=lambda t, si=s, a=ax: self._set_wcs(si, a, t),
+                    getter=lambda si=s, a=ax: self.app.machine_to_disp(
+                        a, self.wcs_vals[si][a]))
+
+    # ------------------------------------------------------------- OPRT leaves
+    def _no_srh(self):
+        txt = self.app.input.take().strip()
+        try:
+            n = int(float(txt))
+        except ValueError:
+            return
+        if self.chapter == "OFFSET":
+            for row, t in enumerate(self._tools()):
+                if t.id == n:
+                    self.cursor.goto_row(row)
+                    return
+        elif self.chapter == "WORK":
+            if 1 <= n <= 9:
+                self.cursor.goto_row(n - 1)
+
+    def _parse_axis_val(self, txt):
+        txt = txt.strip()
+        if txt and txt[0] in self.app.axes:
+            try:
+                return txt[0], float(txt[1:])
+            except ValueError:
+                pass
+        return None, None
+
+    def _tool_measure(self):
+        """MEASUR on tool page: Z<ref> -> length = machine Z - ref.
+        Typed ref is display units. Probe cycles call
+        _set_tool_machine directly."""
+        ax, val = self._parse_axis_val(self.app.input.take())
+        if ax != "Z":
+            return
+        row = self.cursor.row()
+        tools = self._tools()
+        if row < len(tools):
+            tid = tools[row].id
+            ref_m = self.app.disp_to_machine("Z", val)
+            length = self.app.stat.actual_position[2] - ref_m
+            self._set_tool_machine(tid, 0, length, "GEOM")
+
+    def _work_measure(self):
+        """MEASUR on work page: G10 L20 — current position becomes <val>.
+        Typed value is display units."""
+        ax, val = self._parse_axis_val(self.app.input.take())
+        if ax is None:
+            return
+        sys_idx = self.cursor.row()
+        val_m = self.app.disp_to_machine(ax, val)
+        mdi_val = (self.app.machine_to_interp(val_m)
+                   if ax in self.app.LINEAR_AXES else val_m)
+        self.app.mdi(f"G10 L20 P{sys_idx + 1} {ax}{mdi_val:.4f}")
+
+        idx = AXIS_IDX[ax]
+        st = self.app.stat
+        if sys_idx + 1 == st.g5x_index:
+            st.poll()                                    # fresh after wait_complete
+            self.wcs_vals[sys_idx][ax] = st.g5x_offset[idx]
+        else:
+            # L20 semantics: offset = machine pos - g92 - desired reading
+            self.wcs_vals[sys_idx][ax] = (st.actual_position[idx]
+                                          - st.g92_offset[idx] - val_m)
+
+    def _input_counter(self):
+        """INP.C.: axis letter -> write the RELATIVE counter value into the
+        cursored field. Setters expect display units, so convert."""
+        txt = self.app.input.take().strip()
+        if txt not in tuple(self.app.axes):
+            return
+        idx = AXIS_IDX[txt]
+        rel = self.app.stat.actual_position[idx] - self.app.rel_origin[idx]
+        self.cursor.commit(f"{self.app.machine_to_disp(txt, rel):.4f}")
+
+    def _clear(self, what):
+        for t in self._tools():
+            if what in ("ALL", "WEAR"):
+                self.wear[t.id] = {"Z": 0.0, "R": 0.0}
+            if what in ("ALL", "GEOM"):
+                self.app.mdi(f"G10 L1 P{t.id} Z0 R0")
+        self._save_wear()
+        if what == "WEAR":                       # re-apply geom minus wear
+            for t in self._tools():
+                self._write_tool(t.id)
+        self.app.command.load_tool_table()
+        self.pop()
+
+    def _read_exec(self):
+        self.app.command.load_tool_table()
+        self.wear = self._load_wear()
+        self.comments = self._read_tool_comments()
+
+    def _punch_exec(self):
+        self._save_wear()                        # .tbl persists via G10 L1 already
+
+    # ------------------------------------------------------------- draw
+    def draw(self, renderer, area):
+        f = self.app.font
+        self._poll_probe(renderer, f)
+        if self.chapter == "OFFSET":
+            self._draw_tools(renderer, f)
+        elif self.chapter == "SETING":
+            self._draw_settings(renderer, f)
+        elif self.chapter == "WORK":
+            self._draw_work(renderer, f)
+        elif self.chapter == "TPROBE":
+            self._draw_tprobe(renderer, f)
+        elif self.chapter in PROBE_PAGES:
+            self._draw_wprobe(renderer, f)
+        elif self.chapter == "PSET":
+            self._draw_pset(renderer, f)
+
+    def _scroll_to_cursor(self, nrows):
+        row = self.cursor.row()
+        if row < self.scroll:
+            self.scroll = row
+        elif row >= self.scroll + self.VISIBLE_ROWS:
+            self.scroll = row - self.VISIBLE_ROWS + 1
+        self.scroll = max(0, min(self.scroll, max(0, nrows - self.VISIBLE_ROWS)))
+
+    def _draw_tools(self, renderer, f):
+        app = self.app
+        title = ("TOOL OFFSET / "
+                 + ("WEAR" if self.sub == "WEAR" else "GEOMETRY")
+                 + f"  ({app.unit_tag()})")
+        draw_line(renderer, f, title, 10, 70)
+        draw_line(renderer, f,
+                  "NO.       LENGTH(Z)          RADIUS        COMMENT", 10, 118)
+        tools = self._tools()
+        self._scroll_to_cursor(len(tools))
+        for vis, row in enumerate(range(self.scroll,
+                                        min(len(tools),
+                                            self.scroll + self.VISIBLE_ROWS))):
+            t = tools[row]
+            y = self.TABLE_Y + vis * self.ROW_H
+            draw_line(renderer, f, f"{t.id:03d}", 10, y)
+            for col, x in ((0, 160), (1, 560)):
+                i = row * 3 + col
+                fld = self.cursor.fields[i]
+                fld.x, fld.y, fld.w, fld.h = x, y - 2, 340, 60
+                val = self._get_tool_val(t.id, col, self.sub)
+                draw_field(renderer, f, app.fmt_axis("Z", val), i, self.cursor)
+            i = row * 3 + 2
+            fld = self.cursor.fields[i]
+            fld.x, fld.y, fld.w, fld.h = 960, y - 2, 470, 60
+            draw_field(renderer, f, self.comments.get(t.id, ""), i, self.cursor)
+
+    def _draw_settings(self, renderer, f):
+        draw_line(renderer, f, "SETTING", 10, 70)
+        fld = self.cursor.fields[0]
+        fld.x, fld.y, fld.w, fld.h = 10, self.TABLE_Y - 2, 900, 60
+        draw_field(renderer, f,
+                   f"DISPLAY UNITS   = {self.app.display_units}",
+                   0, self.cursor)
+
+    def _draw_work(self, renderer, f):
+        app = self.app
+        axes = app.axes
+        draw_line(renderer, f,
+                  f"WORK COORDINATE SYSTEM  ({app.unit_tag()})", 10, 70)
+        hdr = "NO.   " + "".join(f"{ax:>10}   " for ax in axes)
+        draw_line(renderer, f, hdr, 10, 118)
+        self._scroll_to_cursor(9)
+        active = app.stat.g5x_index
+        for vis, s in enumerate(range(self.scroll,
+                                      min(9, self.scroll + self.VISIBLE_ROWS))):
+            y = self.TABLE_Y + vis * self.ROW_H
+            draw_line(renderer, f,
+                      WCS_NAMES[s] + ("*" if s + 1 == active else " "), 10, y)
+            for a, ax in enumerate(axes):
+                i = s * len(axes) + a
+                fld = self.cursor.fields[i]
+                fld.x, fld.y, fld.w, fld.h = (self.WCOL_X0 + a * self.WCOL_PITCH,
+                                              y - 2, self.WCOL_W, 60)
+                draw_field(renderer, f,
+                           app.fmt_axis(ax, self.wcs_vals[s][ax]),
+                           i, self.cursor)
+
+    # ------------------------------------------------------------- probing
+    def _pdefaults(self):
+        d = self.app.persist.setdefault("probe", {})
+        for key, _lbl, dflt in PROBE_PARAMS:
+            d.setdefault(key, dflt)
+        d.setdefault("zero_height", 0.0)
+        return d
+
+    def _pset_val(self, key, text):
+        try:
+            self._pdefaults()[key] = float(text)
+        except ValueError:
+            return
+        self.app.save_persist()
+
+    def _build_pset_cursor(self):
+        self.cursor = FieldCursor(cols=1)
+        for key, _lbl, _d in PROBE_PARAMS:
+            self.cursor.add(0, 0, 300, 52,
+                setter=lambda t, k=key: self._pset_val(k, t),
+                getter=lambda k=key: self._pdefaults()[k])
+
+    def _build_probe_grid(self):
+        self.cursor = FieldCursor(cols=3)
+        for _ in range(9):
+            self.cursor.add(0, 0, 80, 80)      # selection = cursor position
+        page = PROBE_PAGES.get(self.chapter, {})
+        # start on the centre Z where it exists, else the first live cell
+        self.cursor.idx = 4 if (1, 1) in page else min(
+            (r * 3 + c for (r, c) in page), default=0)
+
+    def _grid_cell(self):
+        page = PROBE_PAGES.get(self.chapter, {})
+        return page.get((self.cursor.idx // 3, self.cursor.idx % 3))
+
+    def _grid_macro(self):
+        cell = self._grid_cell()
+        return cell[0] if cell else None
+
+    def _probe_ready(self):
+        st = self.app.stat
+        if st.estop or st.task_state != linuxcnc.STATE_ON:
+            self.app.alarms.active.appendleft(
+                {"time": "", "text": "MACHINE NOT READY", "alarm": True})
+            return False
+        if st.interp_state != linuxcnc.INTERP_IDLE:
+            self.app.alarms.active.appendleft(
+                {"time": "", "text": "PROGRAM RUNNING", "alarm": True})
+            return False
+        return True
+
+    def _wprobe_exec(self):
+        name = self._grid_macro()
+        if not name or not self._probe_ready():
+            return
+        d = self._pdefaults()
+        args = " ".join(f"[{d[k]:g}]" for k, _l, _x in PROBE_PARAMS)
+        self._probe_note = ""
+        self.app.mdi_async(f"o<{name}> call {args}")
+        # CAL derives a stylus correction rather than setting an offset
+        self._probe_pending = "CAL" if self.chapter == "PCAL" else "WORK"
+
+    def _tprobe_exec(self):
+        if not self._probe_ready():
+            return
+        zh = self._pdefaults()["zero_height"]
+        self.app.mdi_async(f"o<{TOOL_SENSOR_MACRO}> call [{zh:g}]")
+        self._probe_pending = "TOOL"      # reload tool table when idle
+
+    def _draw_pset(self, renderer, f):
+        draw_line(renderer, f, "PROBE SETTINGS", 10, 70)
+        d = self._pdefaults()
+        self._scroll_to_cursor(len(PROBE_PARAMS))
+        for vis, i in enumerate(range(self.scroll,
+                                      min(len(PROBE_PARAMS),
+                                          self.scroll + self.VISIBLE_ROWS))):
+            key, label, _x = PROBE_PARAMS[i]
+            y = 150 + vis * 66
+            draw_line(renderer, f, label, 10, y)
+            fld = self.cursor.fields[i]
+            fld.x, fld.y, fld.w, fld.h = 560, y - 2, 300, 56
+            draw_field(renderer, f, f"{d[key]:g}", i, self.cursor)
+
+    GRID_X, GRID_Y, CELL = 40, 180, 100
+
+    def _draw_wprobe(self, renderer, f):
+        page = PROBE_PAGES[self.chapter]
+        title = dict(PROBE_PAGE_KEYS)[self.chapter]
+        draw_line(renderer, f, f"WORK PROBE / {title}", 10, 70)
+        for r in range(3):
+            for c in range(3):
+                i = r * 3 + c
+                x = self.GRID_X + c * (self.CELL + 6)
+                y = self.GRID_Y + r * (self.CELL + 6)
+                fld = self.cursor.fields[i]
+                fld.x, fld.y, fld.w, fld.h = x, y, self.CELL, self.CELL
+                cell = page.get((r, c))
+                if self.cursor.is_current(i):
+                    SDL_SetRenderDrawColor(renderer, 60, 60, 60, 255)
+                    SDL_RenderFillRect(renderer,
+                                       SDL_Rect(x, y, self.CELL, self.CELL))
+                SDL_SetRenderDrawColor(renderer,
+                                       *((27, 95, 165) if cell else (45, 45, 45)),
+                                       255)
+                SDL_RenderDrawRect(renderer, SDL_Rect(x, y, self.CELL, self.CELL))
+                if cell:
+                    draw_probe_icon(renderer, cell[1], r, c, x, y, self.CELL)
+        # large diagram of the selected cell — same routine, bigger box
+        cell = self._grid_cell()
+        if cell:
+            draw_probe_icon(renderer, cell[1], self.cursor.idx // 3,
+                            self.cursor.idx % 3, 420, 170, 260)
+        st = self.app.stat
+        draw_line(renderer, f, cell[0] if cell else "(empty cell)",
+                  730, 200, WHITE if cell else RED)
+        if self.chapter == "PCAL":
+            d = self._pdefaults()
+            draw_line(renderer, f,
+                      f"GAUGE SIZE: {d['dia_hint']:g}  (DIA HINT)", 730, 260)
+            draw_line(renderer, f, "SET GAUGE SIZE IN [P.SET]", 730, 320,
+                      SDL_Color(150, 150, 150))
+            draw_line(renderer, f, "CENTRE PROBE OVER GAUGE, THEN EXEC",
+                      730, 380, SDL_Color(255, 150, 40))
+        else:
+            draw_line(renderer, f, f"WRITES TO: {WCS[st.g5x_index]}", 730, 260)
+            draw_line(renderer, f, "DIMS IN [P.SET]", 730, 320,
+                      SDL_Color(150, 150, 150))
+            draw_line(renderer, f, "POSITION PROBE, THEN EXEC", 730, 380,
+                      SDL_Color(255, 150, 40))
+        if getattr(self, "_probe_note", ""):
+            draw_line(renderer, f, self._probe_note, 730, 440, RED)
+
+    def _draw_tprobe(self, renderer, f):
+        draw_line(renderer, f, "TOOL LENGTH PROBE", 10, 70)
+        st = self.app.stat
+        # --- BT taper (red) ---
+        SDL_SetRenderDrawColor(renderer, 250, 60, 60, 255)
+        SDL_RenderDrawLine(renderer, 150, 110, 150, 148)     # flange, left
+        SDL_RenderDrawLine(renderer, 250, 110, 250, 148)     # flange, right
+        SDL_RenderDrawLine(renderer, 150, 148, 178, 178)     # taper, left
+        SDL_RenderDrawLine(renderer, 250, 148, 222, 178)     # taper, right
+        SDL_RenderDrawLine(renderer, 178, 178, 222, 178)     # taper face
+        SDL_RenderDrawLine(renderer, 150, 110, 250, 110)     # flange top
+        # --- endmill body + flutes (blue) ---
+        SDL_SetRenderDrawColor(renderer, 133, 183, 235, 255)
+        SDL_RenderDrawRect(renderer, SDL_Rect(178, 178, 44, 130))
+        for i in range(4):
+            y0 = 190 + i * 32
+            SDL_RenderDrawLine(renderer, 178, y0 + 26, 222, y0)
+        # --- touch plate bracket (green) ---
+        SDL_SetRenderDrawColor(renderer, 60, 200, 90, 255)
+        SDL_RenderDrawLine(renderer, 140, 356, 260, 356)
+        SDL_RenderDrawLine(renderer, 140, 356, 140, 382)
+        SDL_RenderDrawLine(renderer, 260, 356, 260, 382)
+
+        draw_line(renderer, f, f"TOOL IN SPINDLE: T{st.tool_in_spindle:02d}",
+                  420, 150)
+        draw_line(renderer, f, "Z ZERO HEIGHT", 420, 230)
+        fld = self.cursor.fields[0]
+        fld.x, fld.y, fld.w, fld.h = 800, 228, 200, 56
+        draw_field(renderer, f, f"{self._pdefaults()['zero_height']:g}",
+                   0, self.cursor)
+        draw_line(renderer, f,
+                  "SENSOR LOCATION FROM [TOOLSENSOR] INI  -  Z.PRB TO RUN",
+                  420, 320, SDL_Color(255, 150, 40))
+
+    def _poll_probe(self, renderer, f):
+        """Called each frame while a probe is running. Keeps the UI live,
+        shows a PROBING banner, and does the read-back exactly when the
+        interpreter returns to idle."""
+        if not getattr(self, "_probe_pending", None):
+            return
+        if self.app.stat.interp_state == linuxcnc.INTERP_IDLE:
+            kind = self._probe_pending
+            self._probe_pending = None
+            if kind == "WORK":
+                self.wcs_vals = self._read_var_wcs()
+            elif kind == "TOOL":
+                self.app.command.load_tool_table()
+            elif kind == "CAL":
+                # the macro computes the correction; entering it is manual
+                # until the storage location is confirmed on the machine
+                self._probe_note = "CAL DONE - ENTER RESULT AS CAL OFFSET"
+        else:
+            draw_line(renderer, f, "PROBING...", 730, 130, RED)
+
+
+class SystemScreen(Screen):
+    def on_enter(self):
+        self.set_root([K(), K(), K(), K(), K(), K(), K(), K(), K(),
+                       K("EXIT", self._exit_menu)])
+
+    def _exit_menu(self):
+        self.push([
+            K("CAN", self.pop),
+            K("EXEC", lambda: setattr(self.app, "quit", True)),
+        ])
+
+    def draw(self, renderer, area):
+        st = self.app.stat
+        f = self.app.font
+        draw_line(renderer, f, f"INI     {st.ini_filename}", 10, 80)
+        draw_line(renderer, f, f"JOINTS  {st.joints}", 10, 150)
+        draw_line(renderer, f, f"KINS    {st.kinematics_type}", 10, 220)
+
+
+class MessageScreen(Screen):
+    def on_enter(self):
+        self.set_root([K("CLEAR", self.app.alarms.reset)])
+
+    def draw(self, renderer, area):
+        f = self.app.font
+        y = 80
+        al = self.app.alarms
+        if al.active:
+            draw_line(renderer, f, "ACTIVE", 10, y, RED); y += 60
+            for e in list(al.active)[:5]:
+                draw_line(renderer, f, f"{e['time']}  {e['text']}", 10, y, RED)
+                y += 55
+            y += 20
+        draw_line(renderer, f, "HISTORY", 10, y); y += 60
+        for e in list(reversed(al.history))[:10]:
+            draw_line(renderer, f, f"{e['time']}  {e['text']}", 10, y)
+            y += 55
+
+
+class GraphicsScreen(Screen):
+    PAN_STEP = 120                    # px per softkey press
+
+    def on_enter(self):
+        app = self.app
+        if not hasattr(app, "backplot"):
+            # sized to the CLIPPED content area (status bar, input line, and
+            # pane all excluded) so edge indicators are never clipped
+            app.backplot = Backplot2D(app.renderer, 1920 - PANE_W,
+                                      SOFTKEY_Y - STATUS_H - BUFFER_H)
+        bp = app.backplot
+        if bp.needs_parse(app.stat):
+            bp.load(app.stat)
+
+        page1 = [
+            K("XY",  lambda: bp.set_view("XY")),
+            K("XZ",  lambda: bp.set_view("XZ")),
+            K("YZ",  lambda: bp.set_view("YZ")),
+            K("ISO", lambda: bp.set_view("ISO")),
+            K("ZOOM-", lambda: bp.zoom(1.25)),
+            K("ZOOM+", lambda: bp.zoom(0.75)),
+            K("<-",  lambda: bp.pan(-self.PAN_STEP, 0)),
+            K("->",  lambda: bp.pan(+self.PAN_STEP, 0)),
+            K("UP",  lambda: bp.pan(0, -self.PAN_STEP)),
+            K("DOWN", lambda: bp.pan(0, +self.PAN_STEP)),
+        ]
+        page2 = [
+            K("FIT",    lambda: (bp.fit(), bp.rebake())),
+            K("REDRAW", bp.reset_trace),
+        ]
+        self.set_root([page1, page2])
+
+    def draw(self, renderer, area):
+        app = self.app
+        bp = app.backplot
+
+        if bp.needs_parse(app.stat):          # file changed while on screen
+            bp.load(app.stat)
+
+        bp.update(app.stat)                   # advance gray-out
+        bp.draw(0, STATUS_H, app.stat)        # plot + marker + UCS arrows
+
+        # UCS letters (engine draws arrows; text needs the font)
+        for name, (x, y) in bp.label_positions().items():
+            r, g, b = AXIS_COLORS[name]
+            draw_line(renderer, app.font, name, x + 6, y - 24, SDL_Color(r, g, b))
+
+        # view name, top-right of the plot area; parse errors in red
+        draw_line(renderer, app.font, bp.view,
+                  1920 - PANE_W - 120, STATUS_H + 10)
+        if bp.last_error:
+            draw_line(renderer, app.font, bp.last_error, 10, STATUS_H + 10,
+                      SDL_Color(250, 0, 0))
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
+class ScreenManager:
+    def __init__(self, app, screens, win_w, win_h):
+        self.app = app
+        self.screens = screens          # {index: Screen}
+        self.W, self.H = win_w, win_h
+        self.content = SDL_Rect(0, STATUS_H, win_w,
+                                SOFTKEY_Y - STATUS_H - BUFFER_H)
+        self.active = None
+        self.active_idx = None
+        self.help_on = False
+        try:
+            with open(os.path.join(os.path.dirname(__file__), "help.json")) as fp:
+                self.help = json.load(fp)
+        except (OSError, ValueError):
+            self.help = {}
+
+    def show(self, idx):
+        if idx in self.screens:
+            self.active = self.screens[idx]
+            self.active_idx = idx
+            variant = PANE_SCREENS.get(idx)
+            w = self.W - (PANE_W if variant else 0)
+            self.content = SDL_Rect(0, STATUS_H, w,
+                                    SOFTKEY_Y - STATUS_H - BUFFER_H)
+            self.active.on_enter()
+
+    def on_softkey(self, i):
+        if self.help_on:                 # any softkey dismisses help
+            self.help_on = False
+            return
+        self.active.on_softkey(i)
+
+    def toggle_help(self):
+        self.help_on = not self.help_on
+
+    def _help_entry(self):
+        """Map the active screen (+ its chapter, if any) to a help entry."""
+        name = type(self.active).__name__.replace("Screen", "").upper()
+        chapter = getattr(self.active, "chapter", None)
+        keys = []
+        if chapter:
+            # probe grid pages all share one entry
+            if chapter in PROBE_PAGES:
+                keys.append(f"{name}_PROBE")
+            keys.append(f"{name}_{chapter}")
+        keys.append(name)
+        for k in keys:
+            if k in self.help:
+                return self.help[k]
+        return self.help.get("_DEFAULT",
+                              {"_title": "HELP", "_body": ["No help available."]})
+
+    def on_key(self, sc):
+        return self.active.on_key(sc)
+
+    def on_edit_key(self, action):
+        fn = getattr(self.active, "edit_key", None)
+        if fn:
+            fn(action)
+
+    def draw(self, renderer):
+        # --- active screen, clipped between status bar and input line ---
+        SDL_RenderSetClipRect(renderer, self.content)
+        self.active.draw(renderer, self.content)
+        SDL_RenderSetClipRect(renderer, None)
+
+        # --- softkey frame ---
+        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255)
+        SDL_RenderDrawLine(renderer, 0, SOFTKEY_Y, self.W, SOFTKEY_Y)
+        for i in range(12):
+            SDL_RenderDrawLine(renderer, KEY_X0 + KEY_W * i, SOFTKEY_Y,
+                               KEY_X0 + KEY_W * i, self.H)
+
+        # --- labels: slot 0 in the left stub, 1-10 in the cells, 11 right stub
+        labels = self.active.softkey_labels()
+        f = self.app.font
+        y = SOFTKEY_Y + 30
+        if labels[0]:
+            draw_line(renderer, f, labels[0], 12, y)
+        for i in range(1, 11):
+            if labels[i]:
+                draw_line(renderer, f, labels[i], KEY_X0 + KEY_W * (i - 1) + 12, y)
+        if labels[11]:
+            draw_line(renderer, f, labels[11], self.W - 48, y)
+
+        self._input_line(renderer)
+
+        variant = PANE_SCREENS.get(self.active_idx)
+        if variant:
+            self.app.pane.draw(renderer, self.W - PANE_W, STATUS_H,
+                               SOFTKEY_Y - STATUS_H, PANE_W, variant)
+
+        if self.help_on:
+            self._draw_help(renderer)
+
+    def _draw_help(self, renderer):
+        entry = self._help_entry()
+        f = self.app.font
+        # dim the screen, then a bordered panel
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND)
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200)
+        SDL_RenderFillRect(renderer, SDL_Rect(0, 0, self.W, self.H))
+        px, py = 120, 120
+        pw, ph = self.W - 240, self.H - 240
+        SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255)
+        SDL_RenderFillRect(renderer, SDL_Rect(px, py, pw, ph))
+        SDL_SetRenderDrawColor(renderer, 60, 120, 220, 255)
+        SDL_RenderDrawRect(renderer, SDL_Rect(px, py, pw, ph))
+
+        draw_line(renderer, f, "HELP - " + entry.get("_title", ""),
+                  px + 30, py + 24, SDL_Color(120, 190, 255))
+        y = py + 90
+        for line in entry.get("_body", []):
+            draw_line(renderer, f, line, px + 30, y)
+            y += 44
+        draw_line(renderer, f, "PRESS ANY SOFTKEY TO CLOSE",
+                  px + 30, py + ph - 54, SDL_Color(255, 150, 40))
+
+    def _input_line(self, renderer):
+        y = SOFTKEY_Y - BUFFER_H
+        txt = self.app.input.text
+        if (SDL_GetTicks() // 500) % 2:          # blinking entry cursor
+            txt += "_"
+        draw_line(renderer, self.app.font, txt, 10, y)
