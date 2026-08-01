@@ -43,6 +43,7 @@ SUBROUTINE_PATH = /path/to/macros
 [TOOLSENSOR]
 # X, Y, HEIGHT, MAXPROBE, SEARCH_VEL, PROBE_VEL — required for tool probing
 
+```
 ---
 
 ## Configuration flags
