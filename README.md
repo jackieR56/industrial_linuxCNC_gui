@@ -3,7 +3,7 @@
 A industrial style operator interface for [LinuxCNC](https://linuxcnc.org/),
 written in Python with [PySDL2](https://pypi.org/project/PySDL2/).
 
-I was unsatisfied with the default interfaces of LinuxCNC, and wanted something more familiar to FANUC and Siemens controllers. I used Claude for most of this, I tried to keep the mess to a minimum but the screens.py file is kind of abysmal, and there are a few weird
+I was unsatisfied with the default interfaces of LinuxCNC, and wanted something more familiar to FANUC and Siemens controllers. I used Claude for most of this, I tried to keep the mess to a minimum but the screens.py file is kind of abysmal, and there are a few weird methods and nomenclature.
 
 This project is intended for 3 to 5 axis mills, I may add lathes and mill turns later if there is interest.
 

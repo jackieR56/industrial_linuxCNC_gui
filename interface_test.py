@@ -212,6 +212,7 @@ class App:
         except (OSError, ValueError):
             self.persist = {}
         self.display_units = self.persist.get("display_units", "MACHINE")
+        self._pending_program = self.persist.get("last_program")
 
         # --- PROG page flags ---
         self.show_mdi_history = True   # True: keep executed MDI blocks listed
@@ -276,8 +277,6 @@ class App:
         self.alarms.reset()
 
     def reload_program(self, path):
-        """Load/reload a program and invalidate GUI-side caches keyed on the
-        path (NDisplay text, backplot parse) so same-path edits refresh."""
         self.command.mode(linuxcnc.MODE_AUTO)
         self.command.wait_complete()
         self.command.program_open(path)
@@ -285,6 +284,8 @@ class App:
         self.ndisp.invalidate()
         if hasattr(self, "backplot"):
             self.backplot._parsed_file = None
+        self.persist["last_program"] = path      # <-- remember it
+        self.save_persist()
 
     # ------------------------------------------------------------- units
     def unit_factor(self):
@@ -376,6 +377,13 @@ def main():
 
     event = SDL_Event()
     running = True
+
+    if app._pending_program and os.path.exists(app._pending_program):
+        try:
+            app.reload_program(app._pending_program)
+        except linuxcnc.error:
+            pass          # stale path / machine not ready — start blank
+    app._pending_program = None
 
     while running:
         app.poll()
