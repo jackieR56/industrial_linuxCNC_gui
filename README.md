@@ -5,10 +5,11 @@ written in Python with [PySDL2](https://pypi.org/project/PySDL2/).
 
 I was unsatisfied with the default interfaces of LinuxCNC, and wanted something more familiar to FANUC and Siemens controllers. I used Claude for most of this, I tried to keep the mess to a minimum but the screens.py file is kind of abysmal, and there are a few weird
 
-This projectis intended for 3 to 5 axis mills, I may add lathes and mill turns later if there is interest.
+This project is intended for 3 to 5 axis mills, I may add lathes and mill turns later if there is interest.
 
-> **Status:** work in progress. Functional on simulation configs; hardware
-> bring-up ongoing. Not yet validated on a live machine — treat accordingly.
+I have this GUI paired with a custom Keypad and panel. It will work with a normal keyboard but you will need to find new mappings for the page keys, as they are on [F3-F19]. Also overrides, cycle start, feed hold, jog buttons and mode dial will need physical IO card inputs, a [7I73 Pendant/control panel interface](https://store.mesanet.com/index.php?route=product/product&product_id=116) shoud be suitable.
+
+This project is still a work in progress and may be unstable, I have yet to commission the actaul machine with this.
 
 ---
 
