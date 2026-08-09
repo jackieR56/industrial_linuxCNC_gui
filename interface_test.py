@@ -23,7 +23,7 @@ from screens import (render_text, blit_text, draw_line, InputBuffer, FieldCursor
 # Config
 # ---------------------------------------------------------------------------
 WIN_W, WIN_H = 1920, 1080
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/siemens_ad_ks.ttc"
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/ISOCPEUR.TTF"
 FONT_SIZE = 48
 LARGE_FONT_SIZE = 180
 # JOG_VEL = 30.0 / 60.0

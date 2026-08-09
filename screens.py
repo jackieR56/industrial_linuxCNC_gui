@@ -131,6 +131,9 @@ PATH_C  = (180, 120, 230)   # purple: probe motion
 
 TOOL_SENSOR_MACRO = "tool_sensor"
 
+# POS-screen home indicators (fed by the status-pane HAL bit pins)
+HOME_C = (255, 255, 255)        # datum mark: axis at its reference position
+
 
 # ---------------------------------------------------------------------------
 # Text rendering
@@ -198,6 +201,22 @@ def draw_circle(renderer, cx, cy, r, seg=14):
         if px is not None:
             SDL_RenderDrawLine(renderer, px, py, x, y)
         px, py = x, y
+
+
+def draw_home_symbol(renderer, cx, cy, r):
+    """Datum mark: circle with two opposed quadrants filled (top-left and
+    bottom-right). Drawn only while the axis is at its reference position —
+    absence of the mark is the 'not referenced' state, so there is nothing
+    to draw for false or unknown."""
+    cx, cy, r = int(cx), int(cy), int(r)
+    _pc(renderer, HOME_C)
+    for dy in range(-r, 0):                     # top-left quadrant
+        dx = int(math.sqrt(max(r * r - dy * dy, 0)))
+        SDL_RenderDrawLine(renderer, cx - dx, cy + dy, cx, cy + dy)
+    for dy in range(0, r + 1):                  # bottom-right quadrant
+        dx = int(math.sqrt(max(r * r - dy * dy, 0)))
+        SDL_RenderDrawLine(renderer, cx, cy + dy, cx + dx, cy + dy)
+    draw_circle(renderer, cx, cy, r, seg=48)
 
 
 def draw_arrow(renderer, x0, y0, x1, y1, head=7):
@@ -551,8 +570,16 @@ class Screen:
 # ---------------------------------------------------------------------------
 class PosScreen(Screen):
 
+    # home-indicator column, clear of the widest large-font DRO row
+    HOME_X = 1200
+    HOME_R = 34
+
     def _dro_pitch(self):
         return 150 if len(self.app.axes) > 3 else 200
+
+    def _at_home(self, ax):
+        pane = getattr(self.app, "pane", None)
+        return pane.at_home(ax) if pane is not None else None
 
     def on_enter(self):
         self.sub = getattr(self, "sub", "MACH")     # keep last sub-page
@@ -610,16 +637,22 @@ class PosScreen(Screen):
         axes = app.axes
         pitch = self._dro_pitch()
 
-        def rows(valfn, title):
+        def rows(valfn, title, home=False):
             draw_line(renderer, f, title, 10, 80)
             for r, ax in enumerate(axes):
                 idx = AXIS_IDX[ax]
+                y = 120 + r * pitch
                 draw_line(renderer, lf,
                           "{}  {}".format(ax, app.fmt_axis(ax, valfn(idx))),
-                          10, 120 + r * pitch)
+                          10, y)
+                # reference-position mark: machine coordinates only, and only
+                # while the axis is actually at home
+                if home and self._at_home(ax):
+                    draw_home_symbol(renderer, self.HOME_X,
+                                     y + TTF_FontHeight(lf) // 2, self.HOME_R)
 
         if self.sub == "MACH":
-            rows(lambda i: st.position[i], "MACHINE")
+            rows(lambda i: st.position[i], "MACHINE", home=True)
         elif self.sub == "ABS":
             rows(lambda i: self._work(st, i), "ABSOLUTE")
         elif self.sub == "REL":

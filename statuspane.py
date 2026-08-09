@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # statuspane.py — corner status pane per hand sketch.
 
+import os
+import subprocess
 import time
 import linuxcnc
 from sdl2 import *
@@ -21,6 +23,17 @@ LOAD_PINS = {
     "X": "status-pane.load-x", "Y": "status-pane.load-y",
     "Z": "status-pane.load-z", "A": "status-pane.load-a",
     "C": "status-pane.load-c", "S": "status-pane.load-s",
+}
+
+# HAL pins for the POS-screen reference-position (home) indicators.
+# Wire them in postgui.hal to the same signals that drive the pendant home
+# lamps (pnl-home-lamp-*), so screen and panel can never disagree: lit only
+# when the axis is homed AND parked within [PANEL]HOME_WINDOW of its
+# [JOINT_N]HOME — Fanuc ZRN semantics. Jog away and the indicator clears.
+HOME_PINS = {
+    "X": "status-pane.home-x", "Y": "status-pane.home-y",
+    "Z": "status-pane.home-z", "A": "status-pane.home-a",
+    "C": "status-pane.home-c",
 }
 
 
@@ -45,7 +58,7 @@ class StatusPane:
         self.run_mark = time.monotonic()
         self._was_running = False
 
-        # optional HAL load component
+        # optional HAL component: load bars + home indicators
         self.hal = None
         if _HAL_OK:
             try:
@@ -53,10 +66,27 @@ class StatusPane:
                 for name in LOAD_PINS.values():
                     self.hal.newpin(name.split(".", 1)[1],
                                     hal.HAL_FLOAT, hal.HAL_IN)
+                for name in HOME_PINS.values():
+                    self.hal.newpin(name.split(".", 1)[1],
+                                    hal.HAL_BIT, hal.HAL_IN)
                 self.hal.ready()
+                self._run_postgui()
             except Exception as e:
                 print("status-pane HAL init failed:", e)
                 self.hal = None
+
+    def _run_postgui(self):
+        """LinuxCNC only auto-runs POSTGUI_HALFILE for the stock GUIs, so a
+        custom DISPLAY has to do it once its pins exist. linuxcnc chdirs into
+        the config dir, so a bare filename resolves. Missing file = nothing to
+        wire, which is not an error."""
+        path = os.path.join(os.getcwd(), "postgui.hal")
+        if not os.path.exists(path):
+            return
+        try:
+            subprocess.run(["halcmd", "-f", path], check=True)
+        except Exception as e:
+            print("postgui.hal failed:", e)
 
     # ------------------------------------------------------------- persist
     def _save(self):
@@ -112,6 +142,27 @@ class StatusPane:
         try:
             return self.hal[LOAD_PINS[axis].split(".", 1)[1]]
         except Exception:
+            return None
+
+    def at_home(self, axis):
+        """Reference-position state for the POS-screen indicators.
+        True/False from the HAL pin; None when the axis has no pin.
+        With HAL present the pin is the only truth — an unwired pin reads
+        False, which shows 'not referenced' rather than a comforting lie.
+        The stat.homed fallback is for dev runs outside LinuxCNC and means
+        'homed', not 'parked at home'; it assumes trivkins (joint order ==
+        app.axes order)."""
+        if self.hal is not None:
+            if axis not in HOME_PINS:
+                return None
+            try:
+                return bool(self.hal[HOME_PINS[axis].split(".", 1)[1]])
+            except Exception:
+                return None
+        try:
+            joint = self.app.axes.index(axis)
+            return bool(self.app.stat.homed[joint])
+        except (ValueError, IndexError):
             return None
 
     # ------------------------------------------------------------- draw
