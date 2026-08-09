@@ -479,12 +479,54 @@ def draw_field(renderer, font, text, i, cursor, pad=6):
 # ---------------------------------------------------------------------------
 # Softkey machinery
 # ---------------------------------------------------------------------------
+# Softkey label colouring. The kind is looked up from the label, so menu
+# definitions stay uncluttered; pass kind= explicitly where the same label
+# means something different (e.g. CLEAR).
+PAGE, ENTRY, ACT, MENU = "page", "entry", "act", "menu"
+
+KEY_KIND = {
+    # page / view selectors — change what the screen shows
+    "PRGRM": PAGE, "EDIT": PAGE, "DIR": PAGE, "USB": PAGE, "CHECK": PAGE,
+    "CURRNT": PAGE, "NEXT": PAGE, "RSTR": PAGE, "MDI": PAGE,
+    "OFFSET": PAGE, "SETING": PAGE, "WORK": PAGE, "PROBE": PAGE,
+    "WEAR": PAGE, "GEOM": PAGE, "ABS": PAGE, "REL": PAGE, "MACH": PAGE,
+    "ALL": PAGE, "TOGO": PAGE, "P.SET": PAGE,
+    "OUT": PAGE, "IN": PAGE, "ANGLE": PAGE, "BOSS": PAGE, "RIDGE": PAGE,
+    "CAL": PAGE,
+    "XY": PAGE, "XZ": PAGE, "YZ": PAGE, "ISO": PAGE,
+    "ZOOM+": PAGE, "ZOOM-": PAGE, "<-": PAGE, "->": PAGE, "UP": PAGE,
+    "DOWN": PAGE, "FIT": PAGE, "REDRAW": PAGE,
+    # data entry / search / edit — consume the typed buffer or move a cursor
+    "INPUT": ENTRY, "+INPUT": ENTRY, "INP.C.": ENTRY,
+    "O SRH": ENTRY, "N SRH": ENTRY, "NO.SRH": ENTRY, "SEARCH": ENTRY,
+    "SRH \\/": ENTRY, "SRH /\\": ENTRY,
+    "INSERT": ENTRY, "ALTER": ENTRY, "ALT.LIN": ENTRY,
+    "DEL.WRD": ENTRY, "DEL.LIN": ENTRY, "PRESET": ENTRY,
+    # machine / file actions
+    "EXEC": ACT, "MEASUR": ACT, "Z.PRB": ACT, "SELECT": ACT, "SAVE": ACT,
+    "READ": ACT, "PUNCH": ACT, "DELETE": ACT, "NEW": ACT, "REFRSH": ACT,
+    "REWIND": ACT, "ORIGIN": ACT, "PTSPRE": ACT, "EXIT": ACT,
+    # menus and back-outs
+    "(OPRT)": MENU, "CLEAR": MENU, "CAN": MENU, "CANCEL": MENU,
+    "RETURN": MENU, "<": MENU, ">": MENU,
+}
+
+KEY_COLORS = {
+    PAGE:  SDL_Color(0, 100, 255),   # cyan   — changes what's displayed
+    ENTRY: SDL_Color(0, 255, 0),   # green  — consumes the typed buffer
+    ACT:   SDL_Color(255, 0, 0),    # orange — commands machine / files
+    MENU:  WHITE,                      # menus, cancel, back
+}
+KEY_HILITE = (230, 230, 230)           # active-key fill (matches _hilite_row)
+
+
 class K:
     """One softkey: label + zero-arg action. Blank label = dead key."""
-    __slots__ = ("label", "action")
-    def __init__(self, label="", action=None):
+    __slots__ = ("label", "action", "kind")
+    def __init__(self, label="", action=None, kind=None):
         self.label = label
         self.action = action
+        self.kind = kind or KEY_KIND.get(label, MENU)
 
 
 def _pad10(items):
@@ -529,11 +571,24 @@ class Screen:
         return pages[idx]
 
     # ---- called by the manager ----
-    def softkey_labels(self):
+    def active_keys(self):
+        """Labels naming the chapter/sub-mode currently on display. Those
+        softkeys are drawn boxed. Override per screen."""
+        return ()
+
+    def softkey_items(self):
+        """12 (label, kind, active) slots: [<], ten keys, [>]."""
         pages, _ = self._stack[-1]
         left  = "<" if len(self._stack) > 1 else ""
         right = ">" if len(pages) > 1 else ""
-        return [left] + [it.label for it in self._page()] + [right]
+        # Only the root level names chapters; a pushed level may reuse one of
+        # those labels for something else (CLEAR -> GEOM), which must not box.
+        act = self.active_keys() if len(self._stack) == 1 else ()
+        items = [(left, MENU, False)]
+        items += [(it.label, it.kind, bool(it.label) and it.label in act)
+                  for it in self._page()]
+        items.append((right, MENU, False))
+        return items
 
     def on_softkey(self, i):
         if i == 0:
@@ -592,6 +647,9 @@ class PosScreen(Screen):
             K(), K(), K(), K(),
             K("(OPRT)", self._oprt),
         ])
+
+    def active_keys(self):
+        return (self.sub,)
 
     def _oprt(self):
         self.push([
@@ -771,6 +829,11 @@ class ProgScreen(Screen):
         return self._CHAPTERS_BY_MODE.get(self.app.stat.task_mode,
                                           ("PRGRM",))
 
+    def active_keys(self):
+        if self.chapter == "CHECK":
+            return (self.chapter, self.check_sub)
+        return (self.chapter,)
+
     def _enter_chapter(self, name):
         if name not in self._valid_chapters():
             name = "PRGRM"
@@ -815,7 +878,7 @@ class ProgScreen(Screen):
         elif self.chapter == "MDI":
             self.push([
                 K("EXEC",  self._mdi_exec),
-                K("CLEAR", self._mdi_clear),
+                K("CLEAR", self._mdi_clear, kind=ENTRY),
             ])
         elif self.chapter in ("DIR", "USB"):
             keys = [
@@ -1567,6 +1630,14 @@ class OffsetScreen(Screen):
         self.wcs_vals = self._read_var_wcs()
         self._enter_chapter(self.chapter)
 
+    def active_keys(self):
+        ch = self.chapter
+        if ch == "OFFSET":                       # WEAR/GEOM share the row
+            return (ch, self.sub)
+        if ch in PROBE_PAGES:                    # chapter POUT -> label OUT
+            return tuple(lbl for pg, lbl in PROBE_PAGE_KEYS if pg == ch)
+        return (ch,)
+
     # ------------------------------------------------------------- root menu
     def _root_row(self, extra=None):
         row = [
@@ -1662,9 +1733,9 @@ class OffsetScreen(Screen):
 
     def _clear_menu(self):
         self.push([
-            K("ALL",  lambda: self._clear("ALL")),
-            K("WEAR", lambda: self._clear("WEAR")),
-            K("GEOM", lambda: self._clear("GEOM")),
+            K("ALL",  lambda: self._clear("ALL"),  kind=ACT),
+            K("WEAR", lambda: self._clear("WEAR"), kind=ACT),
+            K("GEOM", lambda: self._clear("GEOM"), kind=ACT),
         ])
 
     def _confirm(self, exec_fn):
@@ -2237,7 +2308,7 @@ class SystemScreen(Screen):
 
 class MessageScreen(Screen):
     def on_enter(self):
-        self.set_root([K("CLEAR", self.app.alarms.reset)])
+        self.set_root([K("CLEAR", self.app.alarms.reset, kind=ACT)])
 
     def draw(self, renderer, area):
         f = self.app.font
@@ -2286,6 +2357,10 @@ class GraphicsScreen(Screen):
             K("REDRAW", bp.reset_trace),
         ]
         self.set_root([page1, page2])
+
+    def active_keys(self):
+        bp = getattr(self.app, "backplot", None)
+        return (bp.view,) if bp else ()
 
     def draw(self, renderer, area):
         app = self.app
@@ -2379,6 +2454,16 @@ class ScreenManager:
         self.active.draw(renderer, self.content)
         SDL_RenderSetClipRect(renderer, None)
 
+        items = self.active.softkey_items()
+
+        # --- active-key boxes (under the frame, so the dividers stay visible)
+        SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
+        for i in range(1, 11):
+            if items[i][2]:
+                SDL_RenderFillRect(renderer, SDL_Rect(
+                    KEY_X0 + KEY_W * (i - 1) + 2, SOFTKEY_Y + 2,
+                    KEY_W - 4, self.H - SOFTKEY_Y - 4))
+
         # --- softkey frame ---
         SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255)
         SDL_RenderDrawLine(renderer, 0, SOFTKEY_Y, self.W, SOFTKEY_Y)
@@ -2387,16 +2472,19 @@ class ScreenManager:
                                KEY_X0 + KEY_W * i, self.H)
 
         # --- labels: slot 0 in the left stub, 1-10 in the cells, 11 right stub
-        labels = self.active.softkey_labels()
         f = self.app.font
         y = SOFTKEY_Y + 30
-        if labels[0]:
-            draw_line(renderer, f, labels[0], 12, y)
+
+        def key_label(i, x):
+            label, kind, active = items[i]
+            if label:
+                draw_line(renderer, f, label, x, y,
+                          BLACK if active else KEY_COLORS[kind])
+
+        key_label(0, 12)
         for i in range(1, 11):
-            if labels[i]:
-                draw_line(renderer, f, labels[i], KEY_X0 + KEY_W * (i - 1) + 12, y)
-        if labels[11]:
-            draw_line(renderer, f, labels[11], self.W - 48, y)
+            key_label(i, KEY_X0 + KEY_W * (i - 1) + 12)
+        key_label(11, self.W - 48)
 
         self._input_line(renderer)
 

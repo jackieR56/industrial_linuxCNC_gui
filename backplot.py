@@ -343,7 +343,7 @@ class Backplot2D:
         """Full redraw of the static plot into the texture.
         Segments up to _progress stay gray (survives view/zoom changes)."""
         SDL_SetRenderTarget(self.renderer, self.tex)
-        SDL_SetRenderDrawColor(self.renderer, 10, 10, 10, 255)
+        SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 255)
         SDL_RenderClear(self.renderer)
         for i, seg in enumerate(self.segments):
             self._draw_seg(seg, executed=(i < self._progress))

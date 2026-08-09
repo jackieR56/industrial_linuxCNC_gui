@@ -96,7 +96,7 @@ def draw_status_box(renderer, font, x, y, w, h, text, active):
         SDL_RenderFillRect(renderer, SDL_Rect(x, y, w, h))
         draw_line(renderer, font, text, x + 8, y + 6)
     else:
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255)
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
         SDL_RenderFillRect(renderer, SDL_Rect(x, y, w, h))
 
 
@@ -420,7 +420,7 @@ def main():
                     mgr.on_key(sc)
 
         # --- draw -----------------------------------------------------------
-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255)
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
         SDL_RenderClear(renderer)
 
         # active screen content + softkey frame/labels + pane
