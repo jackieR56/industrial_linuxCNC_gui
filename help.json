@@ -218,6 +218,8 @@
       "the start position, purple is the movement.",
       "The center cell is a Z touch.",
       "Use the arrow keys to select a cell.",
+      "The text under the grid is read from the probe",
+      "routine itself. It says where to put the probe.",
       "P.SET has the clearances and the feeds.",
       "The control writes to the active system.",
       "",

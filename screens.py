@@ -28,6 +28,51 @@ PANE_W   = 460          # status pane width (statuspane imports this)
 # data partition.
 WEAR_FILE = os.path.join(os.path.dirname(__file__), "tool_wear.json")
 
+# Probe macros. LinuxCNC resolves these by SUBROUTINE_PATH when it runs them;
+# we only read them here, to show the operator the routine's own placement
+# instructions rather than a generic "position the probe" line.
+MACRO_DIR = os.path.join(os.path.dirname(__file__), "macros", "macros")
+
+_MACRO_META  = re.compile(r"^(author|version|date)\s*:", re.I)
+_MACRO_BOILER = "ensure all settings"
+_macro_help_cache = {}
+
+
+def macro_help(name):
+    """The leading comment block of macros/<name>.ngc, minus the metadata and
+    the boilerplate trailer. [0] is what the routine does, [1:] is where to
+    put the probe. Empty when the macro has no header (tool_sensor) or cannot
+    be read — this is called from the draw loop, so it must not raise."""
+    if name in _macro_help_cache:
+        return _macro_help_cache[name]
+    out = []
+    try:
+        with open(os.path.join(MACRO_DIR, name + ".ngc")) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                if not (line.startswith("(") and line.endswith(")")):
+                    break               # first real g-code ends the header
+                body = line[1:-1].strip()
+                if not body or _MACRO_META.match(body):
+                    continue
+                # The "ensure all settings..." trailer is boilerplate. Six
+                # macros wrap it mid-line, so keep whatever real text precedes
+                # it and stop — no macro has anything useful after it.
+                cut = body.lower().find(_MACRO_BOILER)
+                if cut >= 0:
+                    body = body[:cut].strip().rstrip(",")
+                    if body:
+                        out.append(body.upper())
+                    break
+                out.append(body.upper())
+    except OSError:
+        out = []
+    res = tuple(out)
+    _macro_help_cache[name] = res
+    return res
+
 WCS_PARAM_BASE = 5221   # G54 X = 5221; each system +20; axes X..W
 # 10-entry, 1-based by g5x_index (status bar):
 WCS = ("None", "G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3")
@@ -60,6 +105,18 @@ PROBE_PARAMS = [
     ("probe_mode",   "MODE (0=SET WCS)", 0),
 ]
 
+# Args past #15 are family-specific and #16 means different things to each,
+# so they are appended per macro rather than folded into PROBE_PARAMS (which
+# is the positional contract every macro shares and must stay 15 long).
+PROBE_EXTRA = [
+    ("wco_rot",     "SET WCS ROTATION (1=YES)", 0),      # edge angle  #16
+    ("cal_dia",     "CAL GAUGE DIA",            10.0),   # cal         #16
+    ("cal_x_width", "CAL GAUGE X WIDTH",        10.0),   # cal         #17
+    ("cal_y_width", "CAL GAUGE Y WIDTH",        10.0),   # cal         #18
+    ("cal_axis",    "CAL AXIS (0=AVG 1=X 2=Y)", 0),      # cal         #19
+]
+PROBE_FIELDS = PROBE_PARAMS + PROBE_EXTRA
+
 # page -> {(row, col): (macro, icon_kind)}
 # row 0 = back (+Y), row 2 = front (-Y); col 0 = left (-X), col 2 = right (+X)
 PZ = ("probe_z_minus_wco", "z")
@@ -87,16 +144,20 @@ PROBE_PAGES = {
         (2, 1): ("probe_y_minus_wco",        "edge_in"),
         (2, 2): ("probe_front_right_inside", "cnr_in"),
     },
+    # The corner macros are named for the direction of their doubled probe,
+    # not for the corner they sit on, which is how they came to be wired a
+    # quarter-turn out. Placement here follows the motion in the .ngc:
+    # x_plus probes the back face once then the LEFT face twice = back left.
     "PANG": {
-        (0, 0): ("probe_corner_y_plus_edge_angle",  "ang_cnr"),
+        (0, 0): ("probe_corner_x_plus_edge_angle",  "ang_cnr"),
         (0, 1): ("probe_back_edge_angle",           "ang_edge"),
-        (0, 2): ("probe_corner_x_plus_edge_angle",  "ang_cnr"),
+        (0, 2): ("probe_corner_y_minus_edge_angle", "ang_cnr"),
         (1, 0): ("probe_left_edge_angle",           "ang_edge"),
         (1, 1): PZ,
         (1, 2): ("probe_right_edge_angle",          "ang_edge"),
-        (2, 0): ("probe_corner_x_minus_edge_angle", "ang_cnr"),
+        (2, 0): ("probe_corner_y_plus_edge_angle",  "ang_cnr"),
         (2, 1): ("probe_front_edge_angle",          "ang_edge"),
-        (2, 2): ("probe_corner_y_minus_edge_angle", "ang_cnr"),
+        (2, 2): ("probe_corner_x_minus_edge_angle", "ang_cnr"),
     },
     "PBOSS": {
         (0, 0): ("probe_rect_boss",    "boss_rect"),
@@ -124,6 +185,20 @@ PROBE_PAGES = {
 }
 PROBE_PAGE_KEYS = (("POUT", "OUT"), ("PIN", "IN"), ("PANG", "ANGLE"),
                    ("PBOSS", "BOSS"), ("PRIDGE", "RIDGE"), ("PCAL", "CAL"))
+
+# Which macros take the extra args. Derived from the pages so they cannot
+# drift; the centre Z cell rides on the ANGLE page but is a plain 15-arg call.
+CAL_MACROS = frozenset(m for m, _k in PROBE_PAGES["PCAL"].values())
+ANG_MACROS = frozenset(m for m, _k in PROBE_PAGES["PANG"].values()) - {PZ[0]}
+
+# Which P.SET fields each cal cell actually reads: the nominal it positions
+# off, and the known-true size it compares against. Not always the same field.
+CAL_FIELDS = {
+    "probe_cal_round_boss":   ("cal_dia",),
+    "probe_cal_round_pocket": ("dia_hint", "cal_dia"),
+    "probe_cal_square_boss":  ("x_hint", "y_hint", "cal_x_width", "cal_y_width"),
+    "probe_cal_square_pocket": ("x_hint", "y_hint", "cal_x_width", "cal_y_width"),
+}
 
 FEAT_C  = (60, 200, 90)     # green:  workpiece faces
 START_C = (250, 60, 60)     # red:    probe start position
@@ -258,55 +333,107 @@ def draw_probe_icon(renderer, kind, r, c, x, y, s):
         path(cx, cy - 0.7 * q, cx, cy + 0.85 * q)
         return
 
-    if kind in ("edge_out", "edge_in", "ang_edge"):
-        tilt = 0.35 * q if kind == "ang_edge" else 0.0
-        inside = (kind == "edge_in")
-        if r in (0, 2):                            # horizontal face
-            if inside:
-                fy = (y + 1.0 * q) if r == 0 else (y + s - 1.0 * q)
-            else:
-                fy = cy
-            feat(cx - 1.7 * q, fy - tilt, cx + 1.7 * q, fy + tilt)
-            sy = cy if inside else (y + 0.9 * q if r == 0 else y + s - 0.9 * q)
-            sx = cx if not tilt else cx - 1.0 * q
-            start(sx, sy)
-            d = 1.0 if fy > sy else -1.0
-            path(sx, sy + d * 0.7 * q, sx, fy - d * 0.35 * q)
-            if tilt:
-                path(cx + 1.0 * q, sy + d * 0.7 * q,
-                     cx + 1.0 * q, fy + tilt - d * 0.35 * q)
-        else:                                      # vertical face
-            if inside:
-                fx = (x + 1.0 * q) if c == 0 else (x + s - 1.0 * q)
-            else:
-                fx = cx
-            feat(fx - tilt, cy - 1.7 * q, fx + tilt, cy + 1.7 * q)
-            sx = cx if inside else (x + 0.9 * q if c == 0 else x + s - 0.9 * q)
-            sy = cy if not tilt else cy - 1.0 * q
-            start(sx, sy)
-            d = 1.0 if fx > sx else -1.0
-            path(sx + d * 0.7 * q, sy, fx - d * 0.35 * q, sy)
-            if tilt:
-                path(sx + d * 0.7 * q, cy + 1.0 * q,
-                     fx + tilt - d * 0.35 * q, cy + 1.0 * q)
+    # Inside walls: the *_wco macros make no Z move and no step-off, so the
+    # tip is already down in the pocket and simply drives out to one wall.
+    if kind == "edge_in":
+        if r in (0, 2):                            # horizontal wall
+            fy = (y + 1.0 * q) if r == 0 else (y + s - 1.0 * q)
+            d = -1.0 if r == 0 else 1.0
+            feat(cx - 1.7 * q, fy, cx + 1.7 * q, fy)
+            start(cx, cy)
+            path(cx, cy + d * 0.7 * q, cx, fy - d * 0.35 * q)
+        else:                                      # vertical wall
+            fx = (x + 1.0 * q) if c == 0 else (x + s - 1.0 * q)
+            d = -1.0 if c == 0 else 1.0
+            feat(fx, cy - 1.7 * q, fx, cy + 1.7 * q)
+            start(cx, cy)
+            path(cx + d * 0.7 * q, cy, fx - d * 0.35 * q, cy)
         return
 
-    if kind in ("cnr_out", "ang_cnr"):
+    # Outside edge: start sits ON the edge. The step-off is the first move,
+    # then it drops beside the stock and probes back into the face.
+    if kind == "edge_out":
+        if r in (0, 2):                            # horizontal face
+            d = -1.0 if r == 0 else 1.0            # outward, away from stock
+            feat(cx - 1.8 * q, cy, cx + 1.8 * q, cy)
+            start(cx, cy)
+            leg(cx, cy, cx, cy + d * 1.7 * q)
+            path(cx, cy + d * 1.7 * q, cx, cy + d * 0.35 * q)
+        else:                                      # vertical face
+            d = -1.0 if c == 0 else 1.0
+            feat(cx, cy - 1.8 * q, cx, cy + 1.8 * q)
+            start(cx, cy)
+            leg(cx, cy, cx + d * 1.7 * q, cy)
+            path(cx + d * 1.7 * q, cy, cx + d * 0.35 * q, cy)
+        return
+
+    # Edge angle: two touches on one face, edge_width apart. Which way the
+    # second point travels differs per macro — front runs right, back left,
+    # left toward the front, right toward the back.
+    if kind == "ang_edge":
+        tilt = 0.4 * q
+        if r in (0, 2):
+            d  = -1.0 if r == 0 else 1.0           # outward
+            s2 = -1.0 if r == 0 else 1.0           # along the edge
+            feat(cx - 1.9 * q, cy - tilt, cx + 1.9 * q, cy + tilt)
+            for i, t in enumerate((-0.8, 0.8)):
+                px = cx + s2 * t * q
+                fy = cy + tilt * (px - cx) / (1.9 * q)
+                if i == 0:
+                    start(px, fy)
+                path(px, fy + d * 1.6 * q, px, fy + d * 0.35 * q)
+        else:
+            d  = -1.0 if c == 0 else 1.0
+            s2 = 1.0 if c == 0 else -1.0
+            feat(cx - tilt, cy - 1.9 * q, cx + tilt, cy + 1.9 * q)
+            for i, t in enumerate((-0.8, 0.8)):
+                py = cy + s2 * t * q
+                fx = cx + tilt * (py - cy) / (1.9 * q)
+                if i == 0:
+                    start(fx, py)
+                path(fx + d * 1.6 * q, py, fx + d * 0.35 * q, py)
+        return
+
+    # Outside corner: start is over the corner itself. It steps off in X,
+    # drops, probes the X face; then lifts, moves diagonally and probes Y.
+    if kind == "cnr_out":
         hx = 1.0 if c == 0 else -1.0        # horizontal face extends this way
         vy = 1.0 if r == 0 else -1.0        # vertical face extends this way
         feat(cx, cy, cx + hx * 2.1 * q, cy)
         feat(cx, cy, cx, cy + vy * 2.1 * q)
-        sx = x + 0.9 * q if c == 0 else x + s - 0.9 * q
-        sy = y + 0.9 * q if r == 0 else y + s - 0.9 * q
-        start(sx, sy)
-        ax = cx + hx * 1.35 * q                          # touch the H face
-        leg(sx, sy, ax, sy)
-        path(ax, sy, ax, cy - vy * 0.35 * q)
-        by = cy + vy * 1.35 * q                          # touch the V face
-        leg(sx, sy, sx, by)
-        path(sx, by, cx - hx * 0.35 * q, by)
+        start(cx, cy)
+        ay = cy + vy * 0.9 * q                           # touch the V face
+        leg(cx, cy, cx - hx * 1.7 * q, ay)
+        path(cx - hx * 1.7 * q, ay, cx - hx * 0.35 * q, ay)
+        bx = cx + hx * 0.9 * q                           # touch the H face
+        leg(cx, cy, bx, cy - vy * 1.7 * q)
+        path(bx, cy - vy * 1.7 * q, bx, cy - vy * 0.35 * q)
         return
 
+    # Corner + angle: three touches. One face once, the adjacent face twice
+    # so the edge angle falls out of the pair.
+    if kind == "ang_cnr":
+        hx = 1.0 if c == 0 else -1.0
+        vy = 1.0 if r == 0 else -1.0
+        feat(cx, cy, cx + hx * 2.1 * q, cy)
+        feat(cx, cy, cx, cy + vy * 2.1 * q)
+        start(cx, cy)
+        if (r == 0) == (c == 0):            # doubled face is the vertical one
+            path(cx + hx * 0.9 * q, cy - vy * 1.7 * q,
+                 cx + hx * 0.9 * q, cy - vy * 0.35 * q)
+            for t in (0.7, 1.75):
+                path(cx - hx * 1.7 * q, cy + vy * t * q,
+                     cx - hx * 0.35 * q, cy + vy * t * q)
+        else:                               # doubled face is the horizontal
+            path(cx - hx * 1.7 * q, cy + vy * 0.9 * q,
+                 cx - hx * 0.35 * q, cy + vy * 0.9 * q)
+            for t in (0.7, 1.75):
+                path(cx + hx * t * q, cy - vy * 1.7 * q,
+                     cx + hx * t * q, cy - vy * 0.35 * q)
+        return
+
+    # Inside corner: start over the inside corner, step diagonally into the
+    # pocket, one plunge, then probe out to each wall in turn.
     if kind == "cnr_in":
         hx = 1.0 if c == 0 else -1.0
         vy = 1.0 if r == 0 else -1.0
@@ -314,9 +441,11 @@ def draw_probe_icon(renderer, kind, r, c, x, y, s):
         vyp = y + 1.1 * q if r == 0 else y + s - 1.1 * q
         feat(vx, vyp, vx + hx * 2.2 * q, vyp)
         feat(vx, vyp, vx, vyp + vy * 2.2 * q)
-        start(cx, cy)
-        path(cx - hx * 0.2 * q, cy, vx + hx * 0.35 * q, cy)
-        path(cx, cy - vy * 0.2 * q, cx, vyp + vy * 0.35 * q)
+        px, py = vx + hx * 1.5 * q, vyp + vy * 1.5 * q   # after the step-off
+        start(vx, vyp)
+        leg(vx, vyp, px, py)
+        path(px - hx * 0.2 * q, py, vx + hx * 0.35 * q, py)
+        path(px, py - vy * 0.2 * q, px, vyp + vy * 0.35 * q)
         return
 
     if kind in ("boss_rect", "boss_round", "pkt_rect", "pkt_round"):
@@ -328,15 +457,21 @@ def draw_probe_icon(renderer, kind, r, c, x, y, s):
             SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 1.5 * q),
                                                   int(cy - 1.15 * q),
                                                   int(3.0 * q), int(2.3 * q)))
+        # Both start centred over the feature. The boss steps out past each
+        # face and probes back in; the pocket plunges and probes outward.
+        hw = 1.35 * q if kind.endswith("round") else 1.5 * q
+        hh = 1.35 * q if kind.endswith("round") else 1.15 * q
+        start(cx, cy)
         if boss:                                   # approach inward
-            start(x + 0.9 * q, cy)
-            path(x + 1.5 * q, cy, cx - 1.75 * q, cy)
-            path(cx, y + 0.75 * q, cx, cy - 1.6 * q)
+            path(cx - 2.2 * q, cy, cx - (hw + 0.3 * q), cy)
+            path(cx + 2.2 * q, cy, cx + (hw + 0.3 * q), cy)
+            path(cx, cy + 2.2 * q, cx, cy + (hh + 0.3 * q))
+            path(cx, cy - 2.2 * q, cx, cy - (hh + 0.3 * q))
         else:                                      # from centre outward
-            start(cx, cy)
-            path(cx - 0.35 * q, cy, cx - 1.15 * q, cy)
-            path(cx + 0.35 * q, cy, cx + 1.15 * q, cy)
-            path(cx, cy - 0.35 * q, cx, cy - 0.95 * q)
+            path(cx - 0.35 * q, cy, cx - (hw - 0.25 * q), cy)
+            path(cx + 0.35 * q, cy, cx + (hw - 0.25 * q), cy)
+            path(cx, cy - 0.35 * q, cx, cy - (hh - 0.25 * q))
+            path(cx, cy + 0.35 * q, cx, cy + (hh - 0.25 * q))
         return
 
     if kind in ("ridge_x", "ridge_y", "valley_x", "valley_y"):
@@ -348,14 +483,14 @@ def draw_probe_icon(renderer, kind, r, c, x, y, s):
                 SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 0.9 * q),
                                                       int(cy - 1.6 * q),
                                                       int(1.8 * q), int(3.2 * q)))
-                start(cx, y + 0.85 * q)
+                start(cx, cy)
                 path(cx - 2.0 * q, cy, cx - 1.15 * q, cy)
                 path(cx + 2.0 * q, cy, cx + 1.15 * q, cy)
             else:
                 SDL_RenderDrawRect(renderer, SDL_Rect(int(cx - 1.6 * q),
                                                       int(cy - 0.9 * q),
                                                       int(3.2 * q), int(1.8 * q)))
-                start(x + 0.85 * q, cy)
+                start(cx, cy)
                 path(cx, cy - 2.0 * q, cx, cy - 1.15 * q)
                 path(cx, cy + 2.0 * q, cx, cy + 1.15 * q)
         else:                                      # valley: gap in the middle
@@ -365,16 +500,16 @@ def draw_probe_icon(renderer, kind, r, c, x, y, s):
                 feat(cx + 2.0 * q, cy - 1.4 * q, cx + 0.9 * q, cy - 1.4 * q)
                 feat(cx + 0.9 * q, cy - 1.4 * q, cx + 0.9 * q, cy + 1.4 * q)
                 start(cx, cy)
-                path(cx - 0.35 * q, cy, cx - 0.6 * q, cy)
-                path(cx + 0.35 * q, cy, cx + 0.6 * q, cy)
+                path(cx - 0.3 * q, cy, cx - 0.7 * q, cy)
+                path(cx + 0.3 * q, cy, cx + 0.7 * q, cy)
             else:
                 feat(cx - 1.4 * q, cy - 2.0 * q, cx - 1.4 * q, cy - 0.9 * q)
                 feat(cx - 1.4 * q, cy - 0.9 * q, cx + 1.4 * q, cy - 0.9 * q)
                 feat(cx - 1.4 * q, cy + 2.0 * q, cx - 1.4 * q, cy + 0.9 * q)
                 feat(cx - 1.4 * q, cy + 0.9 * q, cx + 1.4 * q, cy + 0.9 * q)
                 start(cx, cy)
-                path(cx, cy - 0.35 * q, cx, cy - 0.6 * q)
-                path(cx, cy + 0.35 * q, cx, cy + 0.6 * q)
+                path(cx, cy - 0.3 * q, cx, cy - 0.7 * q)
+                path(cx, cy + 0.3 * q, cx, cy + 0.7 * q)
         return
 
 
@@ -603,6 +738,10 @@ class Screen:
     # ---- override per screen ----
     def on_enter(self):
         pass
+
+    def on_touch(self, x, y):
+        """A press inside the content area. Return True if consumed."""
+        return False
 
     def on_key(self, sc):
         if self.cursor:
@@ -2103,7 +2242,7 @@ class OffsetScreen(Screen):
     # ------------------------------------------------------------- probing
     def _pdefaults(self):
         d = self.app.persist.setdefault("probe", {})
-        for key, _lbl, dflt in PROBE_PARAMS:
+        for key, _lbl, dflt in PROBE_FIELDS:
             d.setdefault(key, dflt)
         d.setdefault("zero_height", 0.0)
         return d
@@ -2117,7 +2256,7 @@ class OffsetScreen(Screen):
 
     def _build_pset_cursor(self):
         self.cursor = FieldCursor(cols=1)
-        for key, _lbl, _d in PROBE_PARAMS:
+        for key, _lbl, _d in PROBE_FIELDS:
             self.cursor.add(0, 0, 300, 52,
                 setter=lambda t, k=key: self._pset_val(k, t),
                 getter=lambda k=key: self._pdefaults()[k])
@@ -2139,6 +2278,19 @@ class OffsetScreen(Screen):
         cell = self._grid_cell()
         return cell[0] if cell else None
 
+    def on_touch(self, x, y):
+        """Tap a probe grid cell to select it — same effect as the arrow keys,
+        and never a path to motion: EXEC and its confirm still run the macro.
+        Only the grid pages are touchable; the scrolling tables lay out rects
+        for visible rows only, so their off-screen rects are stale."""
+        if self.chapter not in PROBE_PAGES or not self.cursor:
+            return False
+        for i, f in enumerate(self.cursor.fields):
+            if f.x <= x < f.x + f.w and f.y <= y < f.y + f.h:
+                self.cursor.idx = i
+                return True
+        return False
+
     def _probe_ready(self):
         st = self.app.stat
         if st.estop or st.task_state != linuxcnc.STATE_ON:
@@ -2156,7 +2308,14 @@ class OffsetScreen(Screen):
         if not name or not self._probe_ready():
             return
         d = self._pdefaults()
-        args = " ".join(f"[{d[k]:g}]" for k, _l, _x in PROBE_PARAMS)
+        keys = [k for k, _l, _x in PROBE_PARAMS]
+        # #16 is wco_rotation to an edge-angle macro but cal_diameter to a cal
+        # macro, so the tail is picked by family — never sent to both.
+        if name in ANG_MACROS:
+            keys += ["wco_rot"]
+        elif name in CAL_MACROS:
+            keys += ["cal_dia", "cal_x_width", "cal_y_width", "cal_axis"]
+        args = " ".join(f"[{d[k]:g}]" for k in keys)
         self._probe_note = ""
         self.app.mdi_async(f"o<{name}> call {args}")
         # CAL derives a stylus correction rather than setting an offset
@@ -2172,11 +2331,11 @@ class OffsetScreen(Screen):
     def _draw_pset(self, renderer, f):
         draw_line(renderer, f, "PROBE SETTINGS", 10, 70)
         d = self._pdefaults()
-        self._scroll_to_cursor(len(PROBE_PARAMS))
+        self._scroll_to_cursor(len(PROBE_FIELDS))
         for vis, i in enumerate(range(self.scroll,
-                                      min(len(PROBE_PARAMS),
+                                      min(len(PROBE_FIELDS),
                                           self.scroll + self.VISIBLE_ROWS))):
-            key, label, _x = PROBE_PARAMS[i]
+            key, label, _x = PROBE_FIELDS[i]
             y = 150 + vis * 66
             draw_line(renderer, f, label, 10, y)
             fld = self.cursor.fields[i]
@@ -2215,22 +2374,28 @@ class OffsetScreen(Screen):
         st = self.app.stat
         draw_line(renderer, f, cell[0] if cell else "(empty cell)",
                   730, 200, WHITE if cell else RED)
-        if self.chapter == "PCAL":
-            d = self._pdefaults()
-            draw_line(renderer, f,
-                      f"GAUGE SIZE: {d['dia_hint']:g}  (DIA HINT)", 730, 260)
-            draw_line(renderer, f, "SET GAUGE SIZE IN [P.SET]", 730, 320,
-                      SDL_Color(150, 150, 150))
-            draw_line(renderer, f, "CENTRE PROBE OVER GAUGE, THEN EXEC",
-                      730, 380, SDL_Color(255, 150, 40))
+        d = self._pdefaults()
+        draw_line(renderer, f, f"WRITES TO: {WCS[st.g5x_index]}", 730, 260)
+        if self.chapter == "PCAL" and cell:
+            # Each cal macro positions off one field and compares against
+            # another, and they are not always the same one — so name both.
+            labels = dict((k, l) for k, l, _x in PROBE_FIELDS)
+            for n, key in enumerate(CAL_FIELDS.get(cell[0], ())):
+                draw_line(renderer, f, f"{labels[key]}: {d[key]:g}",
+                          730, 320 + n * 46, SDL_Color(150, 150, 150))
         else:
-            draw_line(renderer, f, f"WRITES TO: {WCS[st.g5x_index]}", 730, 260)
             draw_line(renderer, f, "DIMS IN [P.SET]", 730, 320,
                       SDL_Color(150, 150, 150))
-            draw_line(renderer, f, "POSITION PROBE, THEN EXEC", 730, 380,
-                      SDL_Color(255, 150, 40))
         if getattr(self, "_probe_note", ""):
-            draw_line(renderer, f, self._probe_note, 730, 440, RED)
+            draw_line(renderer, f, self._probe_note, 730, 510, RED)
+        # The routine's own placement instructions, read from its .ngc. Full
+        # width below the grid — the macro authors already wrapped these.
+        if cell:
+            lines = macro_help(cell[0])
+            for n, txt in enumerate(lines):
+                draw_line(renderer, f, txt, 40, 560 + n * 44,
+                          SDL_Color(150, 150, 150) if n == 0
+                          else SDL_Color(255, 150, 40))
 
     def _draw_tprobe(self, renderer, f):
         draw_line(renderer, f, "TOOL LENGTH PROBE", 10, 70)
@@ -2398,6 +2563,7 @@ class ScreenManager:
         self.active = None
         self.active_idx = None
         self.help_on = False
+        self.pressed_key = None         # softkey slot held by finger/mouse
         try:
             with open(os.path.join(os.path.dirname(__file__), "help.json")) as fp:
                 self.help = json.load(fp)
@@ -2419,6 +2585,38 @@ class ScreenManager:
             self.help_on = False
             return
         self.active.on_softkey(i)
+
+    # ---- touch / pointer ----------------------------------------------------
+    # Softkeys fire on RELEASE and only if the finger is still on the key it
+    # went down on, so a mis-touch can be aborted by sliding off before lifting
+    # — worth having when EXEC is one of the keys. Selection acts on press.
+
+    def softkey_at(self, x, y):
+        """Softkey slot 0-11 under a point, or None if the point is above the
+        softkey band. Inverse of the layout drawn in draw()."""
+        if y < SOFTKEY_Y:
+            return None
+        if x < KEY_X0:
+            return 0                     # [<] stub
+        return min(11, (x - KEY_X0) // KEY_W + 1)
+
+    def on_press(self, x, y):
+        if self.help_on:                 # a tap anywhere dismisses help
+            self.help_on = False
+            return
+        self.pressed_key = self.softkey_at(x, y)
+        if self.pressed_key is None and self.active:
+            self.active.on_touch(x, y)
+
+    def on_drag(self, x, y):
+        # Slid off the key it went down on: drop the highlight and the arm.
+        if self.pressed_key is not None and self.softkey_at(x, y) != self.pressed_key:
+            self.pressed_key = None
+
+    def on_release(self, x, y):
+        i, self.pressed_key = self.pressed_key, None
+        if i is not None and self.softkey_at(x, y) == i:
+            self.on_softkey(i)
 
     def toggle_help(self):
         self.help_on = not self.help_on
@@ -2456,13 +2654,27 @@ class ScreenManager:
 
         items = self.active.softkey_items()
 
+        # A key held by a finger lights the same as an active one, so the
+        # label stays readable against the fill either way.
+        def lit(i):
+            return items[i][2] or i == self.pressed_key
+
         # --- active-key boxes (under the frame, so the dividers stay visible)
         SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
+        kh = self.H - SOFTKEY_Y - 4
         for i in range(1, 11):
-            if items[i][2]:
+            if lit(i):
                 SDL_RenderFillRect(renderer, SDL_Rect(
-                    KEY_X0 + KEY_W * (i - 1) + 2, SOFTKEY_Y + 2,
-                    KEY_W - 4, self.H - SOFTKEY_Y - 4))
+                    KEY_X0 + KEY_W * (i - 1) + 2, SOFTKEY_Y + 2, KEY_W - 4, kh))
+        # The [<] / [>] stubs have no box of their own; light them on press
+        # only, so a touch on them is acknowledged too.
+        if self.pressed_key == 0:
+            SDL_RenderFillRect(renderer, SDL_Rect(
+                2, SOFTKEY_Y + 2, KEY_X0 - 4, kh))
+        elif self.pressed_key == 11:
+            x0 = KEY_X0 + KEY_W * 10
+            SDL_RenderFillRect(renderer, SDL_Rect(
+                x0 + 2, SOFTKEY_Y + 2, self.W - x0 - 4, kh))
 
         # --- softkey frame ---
         SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255)
@@ -2476,10 +2688,10 @@ class ScreenManager:
         y = SOFTKEY_Y + 30
 
         def key_label(i, x):
-            label, kind, active = items[i]
+            label, kind, _active = items[i]
             if label:
                 draw_line(renderer, f, label, x, y,
-                          BLACK if active else KEY_COLORS[kind])
+                          BLACK if lit(i) else KEY_COLORS[kind])
 
         key_label(0, 12)
         for i in range(1, 11):

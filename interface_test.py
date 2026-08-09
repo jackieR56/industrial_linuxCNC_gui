@@ -377,6 +377,7 @@ def main():
 
     event = SDL_Event()
     running = True
+    finger = None                   # id of the one finger we track at a time
 
     if app._pending_program and os.path.exists(app._pending_program):
         try:
@@ -418,6 +419,39 @@ def main():
                     mgr.on_softkey(SOFTKEYS[sc])
                 else:
                     mgr.on_key(sc)
+
+            # --- touch / pointer ------------------------------------------
+            # Both families are handled: SDL synthesises mouse events from
+            # touch by default, but that is a hint a kiosk config can turn
+            # off. The SDL_TOUCH_MOUSEID guard is what stops one tap firing
+            # twice while synthesis is on. Finger coords are normalised.
+            elif event.type == SDL_MOUSEBUTTONDOWN:
+                if (event.button.button == SDL_BUTTON_LEFT
+                        and event.button.which != SDL_TOUCH_MOUSEID):
+                    mgr.on_press(event.button.x, event.button.y)
+
+            elif event.type == SDL_MOUSEBUTTONUP:
+                if (event.button.button == SDL_BUTTON_LEFT
+                        and event.button.which != SDL_TOUCH_MOUSEID):
+                    mgr.on_release(event.button.x, event.button.y)
+
+            elif event.type == SDL_MOUSEMOTION:
+                if event.motion.state and event.motion.which != SDL_TOUCH_MOUSEID:
+                    mgr.on_drag(event.motion.x, event.motion.y)
+
+            elif event.type == SDL_FINGERDOWN and finger is None:
+                finger = event.tfinger.fingerId      # ignore a resting palm
+                mgr.on_press(int(event.tfinger.x * mgr.W),
+                             int(event.tfinger.y * mgr.H))
+
+            elif event.type == SDL_FINGERMOTION and event.tfinger.fingerId == finger:
+                mgr.on_drag(int(event.tfinger.x * mgr.W),
+                            int(event.tfinger.y * mgr.H))
+
+            elif event.type == SDL_FINGERUP and event.tfinger.fingerId == finger:
+                finger = None
+                mgr.on_release(int(event.tfinger.x * mgr.W),
+                               int(event.tfinger.y * mgr.H))
 
         # --- draw -----------------------------------------------------------
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
