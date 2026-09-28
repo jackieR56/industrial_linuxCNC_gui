@@ -219,12 +219,30 @@ class SystemScreen(Screen):
                    K("EXEC", lambda: (exec_fn(), self.pop()))])
 
     def _exit_menu(self):
+        if not self._off():
+            return
         if self.doc is not None and self.doc.dirty:
             self.note = "UNSAVED EDITS WILL BE LOST"
         self.push([K("CAN", self.pop),
-                   K("EXEC", lambda: setattr(self.app, "quit", True))])
+                   K("EXEC", lambda: (self._exit(), self.pop()))])
+
+    def _exit(self):
+        # re-checked at EXEC: the machine may have been switched on (or a
+        # program started) between opening the menu and pressing EXEC.
+        # Exiting the DISPLAY program shuts LinuxCNC down.
+        if not self._off():
+            return
+        self.app.quit = True
 
     # ------------------------------------------------------------- guards
+    def _off(self):
+        """EXIT/RESTART end the DISPLAY process, which shuts LinuxCNC down:
+        only allowed with the machine off (ESTOP or OFF)."""
+        if not self.app.machine_off():
+            self.note = "TURN MACHINE OFF FIRST"
+            return False
+        return True
+
     def _idle(self):
         if self.app.stat.interp_state != linuxcnc.INTERP_IDLE:
             self.note = "CANNOT EDIT WHILE RUNNING"
@@ -290,7 +308,7 @@ class SystemScreen(Screen):
         self.doc.dirty = False
         if self.ini_doc is not None and self.ini_doc.path == self.doc.path:
             self.ini_doc = None          # re-read for [SEC]KEY resolution
-        self.note = "SAVED (.BAK WRITTEN) - RESTART TO APPLY"
+        self.note = "SAVED (.BAK KEPT) - RESTART TO APPLY"
         return True
 
     def _save_menu(self):
@@ -300,7 +318,7 @@ class SystemScreen(Screen):
         if not self.doc.dirty:
             self.note = "NO CHANGES"
             return
-        self.note = f"SAVE {self.doc.name()} - OLD COPY KEPT AS .BAK"
+        self.note = f"SAVE {self.doc.name()} - LAST 5 COPIES KEPT (.BAK, .BAK.1..)"
         self._confirm(self._save)
 
     def _cancel(self):
@@ -341,12 +359,12 @@ class SystemScreen(Screen):
         if not os.path.exists(configfile.backup_path(path)):
             self.note = "NO .BAK FILE"
             return
-        self.note = f"REPLACE {os.path.basename(path)} WITH ITS .BAK"
+        self.note = f"REPLACE {os.path.basename(path)} WITH NEWEST .BAK (OF {len(configfile.list_backups(path))})"
         self._confirm(lambda: self._restore(path))
 
     # ------------------------------------------------------------- restart
     def _restart_menu(self):
-        if not self._idle():
+        if not self._idle() or not self._off():
             return
         if not os.environ.get(RESTART_FLAG_ENV):
             self.note = "NO LAUNCHER - START WITH run_gui.sh, OR EXIT AND START AGAIN"
@@ -357,7 +375,8 @@ class SystemScreen(Screen):
         self._confirm(self._restart)
 
     def _restart(self):
-        if not self._idle():
+        # re-checked at EXEC, not only when the menu opened
+        if not self._idle() or not self._off():
             return
         if self.doc is not None and self.doc.dirty and not self._save():
             return
@@ -484,8 +503,8 @@ class SystemScreen(Screen):
         dst = os.path.join(self.config_dir, e[0])
         try:
             if os.path.exists(dst):
-                shutil.copy2(dst, configfile.backup_path(dst))
-            shutil.copy(e[2], dst)
+                configfile.rotate_backups(dst)
+            configfile.copy_and_sync(e[2], dst)
             self.note = f"COPIED {e[0]} -> CONFIG DIR"
         except OSError as err:
             self.note = f"COPY FAILED: {err.strerror or err}"
@@ -1114,9 +1133,9 @@ class SystemScreen(Screen):
                            and self.doc.dirty else "")),
         ]
         if self.sel_path:
-            bak = configfile.backup_path(self.sel_path)
-            rows.append(("BACKUP", os.path.basename(bak)
-                         + ("" if os.path.exists(bak) else "   (NONE)")))
+            baks = configfile.list_backups(self.sel_path)
+            rows.append(("BACKUP", f"{len(baks)} KEPT, NEWEST "
+                         + os.path.basename(baks[0]) if baks else "(NONE)"))
         flag = os.environ.get(RESTART_FLAG_ENV)
         rows.append(("RESTART", f"LAUNCHER OK ({flag})" if flag
                      else "NO LAUNCHER - START WITH run_gui.sh"))

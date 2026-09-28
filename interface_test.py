@@ -3,8 +3,14 @@
 
 import os
 import re
+import sys
 import json
+import time
 import ctypes
+import logging
+import tempfile
+import traceback
+from logging.handlers import RotatingFileHandler
 from sdl2 import *
 from sdl2.sdlttf import *
 from collections import deque
@@ -13,6 +19,7 @@ from statuspane import StatusPane
 
 import linuxcnc
 import settings
+import configfile
 
 from screens import (draw_line, text_width, InputBuffer,
                      PosScreen, ProgScreen, OffsetScreen,
@@ -39,9 +46,15 @@ MODES = ("None", "MANU", "AUTO", "MDI")
 CAN_HOLD_MS = 1000     # hold CAN this long to wipe the whole input buffer
 
 # persistent counters/settings (parts, run hours, display units).
-# NOTE for the read-only-rootfs deployment: point this at the writable
-# data partition.
+# NOTE for the read-only-rootfs deployment: point this AND ERROR_LOG below
+# at the writable data partition.
 PERSIST = os.path.join(os.path.dirname(__file__), "machine_counters.json")
+
+# tracebacks of exceptions caught in the main loop (rotating, 1 MB x 3)
+ERROR_LOG = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
+                         "linuxcnc-gui-errors.log")
+ERROR_STORM_S = 5.0     # identical exceptions within this window are counted
+PERSIST_ALARM_S = 60.0  # at most one COUNTERS SAVE FAILED alarm per minute
 
 # screen indices
 POSITION = 0
@@ -156,6 +169,9 @@ class AlarmSystem:
         self.active = deque(maxlen=active_max)
         self.history = deque(maxlen=history_max)
         self._chan = linuxcnc.error_channel()
+        # set when an NML_ERROR arrives; App.poll consumes and clears it
+        # (parts counter: an error during a cycle is an abort, not a part)
+        self.error_seen = False
 
     def poll(self):
         while True:
@@ -163,6 +179,8 @@ class AlarmSystem:
             if not err:
                 break
             kind, text = err
+            if kind == linuxcnc.NML_ERROR:
+                self.error_seen = True
             entry = {
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "text": (text or "").strip() or "(no message)",
@@ -179,6 +197,69 @@ class AlarmSystem:
 
     def latest(self):
         return self.active[0] if self.active else None
+
+
+class ErrorReporter:
+    """Main-loop exception sink. This process is LinuxCNC's DISPLAY: if it
+    dies the control shuts down, so a GUI bug must become an alarm line and
+    a log entry, never an exit. Identical exceptions (same type and text)
+    within ERROR_STORM_S are only counted; the count is reported once the
+    window has passed, so a per-frame fault gives one alarm per 5 s, not
+    60 per second. A different exception is reported immediately."""
+
+    def __init__(self, app):
+        self.app = app
+        self.log = logging.getLogger("linuxcnc-gui")
+        self.log.setLevel(logging.ERROR)
+        self.log.propagate = False
+        try:
+            h = RotatingFileHandler(ERROR_LOG, maxBytes=1024 * 1024,
+                                    backupCount=3)
+            h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            self.log.addHandler(h)
+        except OSError as e:
+            print(f"GUI error log unavailable ({ERROR_LOG}): {e}",
+                  file=sys.stderr)
+        self._key = None            # (type, str) of the last reported one
+        self._t = 0.0               # monotonic time of the last report
+        self._suppressed = 0        # identical ones since then
+
+    def report(self, e):
+        """Call from an `except Exception as e:` block. Never raises."""
+        try:
+            now = time.monotonic()
+            key = (type(e), str(e))
+            if key == self._key and now - self._t < ERROR_STORM_S:
+                self._suppressed += 1
+                return
+            self._flush()                       # previous storm's count
+            self._key, self._t = key, now
+            tb = "".join(traceback.format_exception(type(e), e,
+                                                    e.__traceback__))
+            print(tb, file=sys.stderr, end="")
+            self.log.error("%s", tb.rstrip())
+            self.app.alarm(f"GUI ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+    def tick(self):
+        """Once per frame: report a pending count once the window is over."""
+        try:
+            if self._suppressed and time.monotonic() - self._t >= ERROR_STORM_S:
+                self._flush()
+        except Exception:
+            pass
+
+    def _flush(self):
+        if not self._suppressed:
+            return
+        n, self._suppressed = self._suppressed, 0
+        self._t = time.monotonic()
+        name, msg = self._key[0].__name__, self._key[1]
+        text = f"GUI ERROR (REPEATED {n}X): {name}: {msg}"
+        print(text, file=sys.stderr)
+        self.log.error("%s", text)
+        self.app.alarm(text)
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +289,13 @@ class App:
         self.quit = False                   # set by SYSTEM -> EXIT -> EXEC
         self.axes = settings.get_str("GUI", "AXES", "XYZAC")   # "XYZ" for 3-axis
         self.rel_origin = [0.0] * 9         # machine units, 9-tuple indexed
+        # parts counter: True once RESET or an NML error hit the running
+        # cycle; StatusPane clears it at cycle start, checks it at cycle end
+        self.aborted_since_start = False
+        self._persist_alarm_t = None        # last COUNTERS SAVE FAILED alarm
 
-        # persistent settings/counters
-        try:
-            with open(PERSIST) as f:
-                self.persist = json.load(f)
-        except (OSError, ValueError):
-            self.persist = {}
+        # persistent settings/counters (self.alarms exists by now)
+        self.persist = self._load_persist()
         self.display_units = self.persist.get("display_units", "MACHINE")
         self._pending_program = self.persist.get("last_program")
 
@@ -233,27 +314,122 @@ class App:
         except linuxcnc.error:
             self.prog_dir = os.path.expanduser("~/linuxcnc/nc_files")
 
-    def save_persist(self):
-        self.persist["display_units"] = self.display_units
+    # ------------------------------------------------------------- persist
+    @staticmethod
+    def _read_json(path):
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: not a JSON object")
+        return data
+
+    def _load_persist(self):
+        """PERSIST, else its .bak (with an alarm), else {} (with an alarm).
+        A missing PERSIST is a first start: {} without an alarm."""
         try:
-            with open(PERSIST, "w") as f:
-                json.dump(self.persist, f)
+            return self._read_json(PERSIST)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            pass
+        # move the bad file aside so the next save's .bak rotation cannot
+        # overwrite the good backup with it
+        try:
+            os.replace(PERSIST, PERSIST + ".corrupt")
         except OSError:
             pass
+        try:
+            data = self._read_json(PERSIST + ".bak")
+            self.alarm("COUNTERS FILE CORRUPT - USING BACKUP")
+            return data
+        except (OSError, ValueError):
+            self.alarm("COUNTERS FILE CORRUPT - COUNTERS RESET")
+            return {}
+
+    def save_persist(self):
+        """Atomic write via configfile.atomic_write (temp file, fsync,
+        rename) with one backup, PERSIST.bak, so a power cut leaves the old
+        or the new file, never a torn one. Runs every 60 s, so a failure
+        alarms at most once per PERSIST_ALARM_S."""
+        self.persist["display_units"] = self.display_units
+        try:
+            configfile.atomic_write(PERSIST, json.dumps(self.persist),
+                                    backup=True, keep=1)
+        except OSError as e:
+            now = time.monotonic()
+            if (self._persist_alarm_t is None
+                    or now - self._persist_alarm_t >= PERSIST_ALARM_S):
+                self._persist_alarm_t = now
+                self.alarm(f"COUNTERS SAVE FAILED: {e}")
+
+    # ------------------------------------------------------------- alarms
+    def alarm(self, text):
+        """Push a GUI-side alarm onto the alarm line / MESSAGE list, same
+        entry shape as AlarmSystem.poll(). Cleared by RESET like the rest."""
+        self.alarms.active.appendleft({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "text": text.upper()[:160],
+            "alarm": True,
+        })
+
+    # ------------------------------------------------------------- state
+    def machine_off(self):
+        """True in ESTOP, ESTOP RESET or OFF: no drive is enabled, so it is
+        safe to end the DISPLAY process (which shuts LinuxCNC down). Gates
+        SYSTEM EXIT/RESTART and closing the window. Reads the last poll."""
+        return self.stat.task_state in (linuxcnc.STATE_ESTOP,
+                                        linuxcnc.STATE_ESTOP_RESET,
+                                        linuxcnc.STATE_OFF)
+
+    def motion_quiet(self):
+        """True when nothing is moving or about to: machine off, or machine
+        on with the interpreter idle, all axes in position, zero commanded
+        velocity and no joint homing. For actions that must not disturb
+        motion but do not need the machine off. Reads the last poll."""
+        st = self.stat
+        return self.machine_off() or (
+            st.interp_state == linuxcnc.INTERP_IDLE
+            and st.inpos
+            and st.current_vel == 0
+            and not any(j["homing"] for j in st.joint[:st.joints]))
 
     def poll(self):
         self.stat.poll()
         self.alarms.poll()
+        # parts counter: an NML error is an abort. Flagged even when the
+        # interp is already idle (the error can abort the program before
+        # this poll sees it running); StatusPane clears the flag at cycle
+        # start, so an error between cycles cannot cost the next part.
+        if self.alarms.error_seen:
+            self.aborted_since_start = True
+            self.alarms.error_seen = False
         # file-change -> reparse O-number
         if self.stat.file != self._last_file:
             self._last_file = self.stat.file
             self.prog_num = program_number(self.stat.file)
 
+    def _switch_mode(self, mode):
+        """Switch task mode and confirm it. Raises linuxcnc.error on a
+        timeout or when task refused (e.g. MDI while a program runs).
+        mode() returns at once when already in `mode`; the poll + compare
+        is the real check, not wait_complete()."""
+        self.command.mode(mode)
+        if self.command.wait_complete() == -1:
+            raise linuxcnc.error("MODE SWITCH TIMEOUT")
+        self.stat.poll()
+        if self.stat.task_mode != mode:
+            raise linuxcnc.error(
+                f"MODE SWITCH REJECTED ({MODES[self.stat.task_mode]})")
+
     def mdi(self, code):
-        self.command.mode(linuxcnc.MODE_MDI)
-        self.command.wait_complete()
+        """Blocking MDI for short commands (G10 etc.). Raises linuxcnc.error
+        if the mode switch fails. Returns False if the command had not
+        completed after wait_complete's 5 s (it keeps running); callers
+        that need the result (offset read-back) must treat that as
+        failure. Operator MDI blocks go through mdi_async instead."""
+        self._switch_mode(linuxcnc.MODE_MDI)
         self.command.mdi(code)
-        self.command.wait_complete()
+        return self.command.wait_complete() != -1
 
     def mdi_async(self, code):
         """Fire an MDI command and return immediately — does NOT wait for the
@@ -262,9 +438,14 @@ class App:
         across many frames; callers watch stat.interp_state for completion so
         the UI loop keeps running. Do not send another command until the
         interp returns to INTERP_IDLE."""
-        self.command.mode(linuxcnc.MODE_MDI)
-        self.command.wait_complete()      # mode switch only — fast
+        self._switch_mode(linuxcnc.MODE_MDI)   # mode switch only — fast
         self.command.mdi(code)            # no wait_complete: let it run
+
+    def run_from_line(self, line):
+        """Cycle start from program line `line` (restart). Raises
+        linuxcnc.error if AUTO mode cannot be entered."""
+        self._switch_mode(linuxcnc.MODE_AUTO)
+        self.command.auto(linuxcnc.AUTO_RUN, line)
 
     def reset(self):
         """RESET key: abort program/MDI execution (interp rewinds to
@@ -274,7 +455,10 @@ class App:
         program, but this also covers a spindle started manually via MDI."""
         c = self.command
         c.abort()
-        c.wait_complete()
+        # never raise from the RESET key path
+        if c.wait_complete() == -1:
+            self.alarm("ABORT TIMEOUT")
+        self.aborted_since_start = True        # parts counter: not a part
         if not self.stat.estop and self.stat.task_state == linuxcnc.STATE_ON:
             c.spindle(linuxcnc.SPINDLE_OFF)
             c.mist(linuxcnc.MIST_OFF)
@@ -283,10 +467,12 @@ class App:
         self.alarms.reset()
 
     def reload_program(self, path):
-        self.command.mode(linuxcnc.MODE_AUTO)
-        self.command.wait_complete()
+        """Open `path` in AUTO. Raises linuxcnc.error on failure (callers
+        catch it); last_program is only remembered on success."""
+        self._switch_mode(linuxcnc.MODE_AUTO)
         self.command.program_open(path)
-        self.command.wait_complete()
+        if self.command.wait_complete() == -1:
+            raise linuxcnc.error("PROGRAM OPEN TIMEOUT")
         self.ndisp.invalidate()
         if hasattr(self, "backplot"):
             self.backplot.invalidate()
@@ -357,13 +543,11 @@ def main():
     renderer = SDL_CreateRenderer(
         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE)
     font = TTF_OpenFont(FONT_PATH.encode(), FONT_SIZE)
-    if not font:
-        print("Could not open font:", FONT_PATH)
-        return
-    large_font = TTF_OpenFont(FONT_PATH.encode(), LARGE_FONT_SIZE)
-    if not large_font:
-        print("Could not open font:", FONT_PATH)
-        return
+    large_font = TTF_OpenFont(FONT_PATH.encode(), LARGE_FONT_SIZE) if font else None
+    if not font or not large_font:
+        print(f"GUI: could not open font {FONT_PATH} "
+              "([GUI]FONT_PATH in the ini) - exiting", file=sys.stderr)
+        sys.exit(1)
 
     app = App()
     app.font = font
@@ -393,131 +577,177 @@ def main():
             pass          # stale path / machine not ready — start blank
     app._pending_program = None
 
+    errors = ErrorReporter(app)
+
+    # Every stage of the frame is guarded: this process is the DISPLAY, and
+    # an escaped exception would shut the control down. Stages are guarded
+    # separately (and each event on its own) so a fault in one - say a draw
+    # bug - does not also starve the event loop and lock out the RESET key.
+    # except Exception deliberately lets KeyboardInterrupt/SystemExit out.
     while running:
-        app.poll()
-        app.pane.update()
+        try:
+            app.poll()
+            app.pane.update()
+        except Exception as e:
+            errors.report(e)
 
         # --- events -------------------------------------------------------
         while SDL_PollEvent(ctypes.byref(event)):
-            if event.type == SDL_QUIT:
-                running = False
+            try:
+                if event.type == SDL_QUIT:
+                    # closing the window ends LinuxCNC: machine off only
+                    if app.machine_off():
+                        running = False
+                    else:
+                        app.alarm("TURN MACHINE OFF BEFORE CLOSING")
 
-            elif event.type == SDL_TEXTINPUT:
-                app.input.feed(event.text.text.decode("utf-8"))
+                elif event.type == SDL_TEXTINPUT:
+                    app.input.feed(event.text.text.decode("utf-8"))
 
-            elif event.type == SDL_KEYDOWN and event.key.repeat == 0:
-                sc = event.key.keysym.scancode
-                if sc == SDL_SCANCODE_ESCAPE:        # RESET key
-                    app.reset()
-                    mgr.screens[PROG].view_line = 0  # rewind PRGRM display
-                elif sc == SDL_SCANCODE_BACKSPACE:   # CAN
-                    can_down = SDL_GetTicks()
-                    if app.input.text:
-                        app.input.backspace()
-                elif sc == SDL_SCANCODE_LALT:
-                    mgr.on_edit_key("ALTER")
-                elif sc == SDL_SCANCODE_INSERT:
-                    mgr.on_edit_key("INSERT")
-                elif sc == SDL_SCANCODE_DELETE:
-                    mgr.on_edit_key("DELETE")
-                elif sc == SDL_SCANCODE_LCTRL:
-                    mgr.toggle_help()
-                elif sc in PAGE_KEYS:
-                    # The SYSTEM editor pages take raw text from an external
-                    # keyboard, where Shift and Caps Lock are modifiers, not
-                    # page keys.
-                    if not (app.input.raw and sc in RAW_MODIFIER_KEYS):
-                        mgr.show(PAGE_KEYS[sc])
-                elif sc in SOFTKEYS:
-                    mgr.on_softkey(SOFTKEYS[sc])
+                elif event.type == SDL_KEYDOWN and event.key.repeat == 0:
+                    sc = event.key.keysym.scancode
+                    if sc == SDL_SCANCODE_ESCAPE:        # RESET key
+                        app.reset()
+                        mgr.screens[PROG].view_line = 0  # rewind PRGRM display
+                    elif sc == SDL_SCANCODE_BACKSPACE:   # CAN
+                        can_down = SDL_GetTicks()
+                        if app.input.text:
+                            app.input.backspace()
+                    elif sc == SDL_SCANCODE_LALT:
+                        mgr.on_edit_key("ALTER")
+                    elif sc == SDL_SCANCODE_INSERT:
+                        mgr.on_edit_key("INSERT")
+                    elif sc == SDL_SCANCODE_DELETE:
+                        mgr.on_edit_key("DELETE")
+                    elif sc == SDL_SCANCODE_LCTRL:
+                        mgr.toggle_help()
+                    elif sc in PAGE_KEYS:
+                        # The SYSTEM editor pages take raw text from an external
+                        # keyboard, where Shift and Caps Lock are modifiers, not
+                        # page keys.
+                        if not (app.input.raw and sc in RAW_MODIFIER_KEYS):
+                            mgr.show(PAGE_KEYS[sc])
+                    elif sc in SOFTKEYS:
+                        mgr.on_softkey(SOFTKEYS[sc])
+                    else:
+                        mgr.on_key(sc)
+
+                elif event.type == SDL_KEYUP:
+                    if event.key.keysym.scancode == SDL_SCANCODE_BACKSPACE:
+                        can_down = None
+
+                # a lost focus can swallow the KEYUP — disarm the hold ourselves
+                elif event.type == SDL_WINDOWEVENT:
+                    if event.window.event == SDL_WINDOWEVENT_FOCUS_LOST:
+                        can_down = None
+
+                # --- touch / pointer ------------------------------------------
+                # Both families are handled: SDL synthesises mouse events from
+                # touch by default, but that is a hint a kiosk config can turn
+                # off. The SDL_TOUCH_MOUSEID guard is what stops one tap firing
+                # twice while synthesis is on. Finger coords are normalised.
+                elif event.type == SDL_MOUSEBUTTONDOWN:
+                    if (event.button.button == SDL_BUTTON_LEFT
+                            and event.button.which != SDL_TOUCH_MOUSEID):
+                        mgr.on_press(event.button.x, event.button.y)
+
+                elif event.type == SDL_MOUSEBUTTONUP:
+                    if (event.button.button == SDL_BUTTON_LEFT
+                            and event.button.which != SDL_TOUCH_MOUSEID):
+                        mgr.on_release(event.button.x, event.button.y)
+
+                elif event.type == SDL_MOUSEMOTION:
+                    if event.motion.state and event.motion.which != SDL_TOUCH_MOUSEID:
+                        mgr.on_drag(event.motion.x, event.motion.y)
+
+                elif event.type == SDL_FINGERDOWN and finger is None:
+                    finger = event.tfinger.fingerId      # ignore a resting palm
+                    mgr.on_press(int(event.tfinger.x * mgr.W),
+                                 int(event.tfinger.y * mgr.H))
+
+                elif event.type == SDL_FINGERMOTION and event.tfinger.fingerId == finger:
+                    mgr.on_drag(int(event.tfinger.x * mgr.W),
+                                int(event.tfinger.y * mgr.H))
+
+                elif event.type == SDL_FINGERUP and event.tfinger.fingerId == finger:
+                    finger = None
+                    mgr.on_release(int(event.tfinger.x * mgr.W),
+                                   int(event.tfinger.y * mgr.H))
+            except Exception as e:
+                errors.report(e)
+
+        try:
+            # CAN held past the threshold: wipe the buffer, once per press
+            if can_down is not None and SDL_GetTicks() - can_down >= CAN_HOLD_MS:
+                app.input.clear()
+                can_down = None
+
+            # --- draw -------------------------------------------------------
+            SDL_SetRenderDrawColor(renderer, *BACKGROUND, 255)
+            SDL_RenderClear(renderer)
+
+            # active screen content + softkey frame/labels + pane
+            mgr.draw(renderer)
+
+            # status bar (drawn over the top band)
+            label_text = f"O{app.prog_num:04d}" if app.prog_num is not None else "O----"
+            draw_line(renderer, font, label_text, 10, 10)
+            draw_line(renderer, font, app.ndisp.text(app.stat), 220, 10)
+
+            t = app.stat.tool_in_spindle
+            draw_line(renderer, font, f"T{t:02d}" if t is not None else "T-", 500, 10)
+            draw_line(renderer, font, WCS[app.stat.g5x_index], 640, 10)
+            draw_line(renderer, font, MODES[app.stat.task_mode], 760, 10)
+            draw_line(renderer, font, app.unit_tag(), 890, 10)
+
+            draw_status_box(renderer, font, 990, 6, 120, 50, "EMG", app.stat.estop)
+
+            # machine clock, right-aligned in the top band
+            clock = datetime.now().strftime("%H:%M:%S")
+            clock_x = WIN_W - 10 - text_width(font, clock)
+            draw_line(renderer, font, clock, clock_x, 10)
+
+            # alarm text is unbounded, so trim it to stop short of the clock
+            latest = app.alarms.latest()
+            if latest is not None:
+                text = latest["text"]
+                avail = clock_x - 20 - 1110
+                while text and text_width(font, text) > avail:
+                    text = text[:-1]
+                draw_line(renderer, font, text, 1110, 10, ALARM)
+        except Exception as e:
+            errors.report(e)
+
+        # SYSTEM EXIT/RESTART set app.quit; honour it only machine-off.
+        # Own guard, so a draw that fails every frame cannot block EXIT.
+        try:
+            if app.quit:
+                app.quit = False
+                if app.machine_off():
+                    running = False
                 else:
-                    mgr.on_key(sc)
+                    # a RESTRT that lost the race leaves its flag file:
+                    # remove it or the next EXIT would relaunch the control
+                    flag = os.environ.get("GUI_RESTART_FLAG")
+                    if flag:
+                        try:
+                            os.remove(flag)
+                        except OSError:
+                            pass
+                    app.alarm("TURN MACHINE OFF BEFORE CLOSING")
+        except Exception as e:
+            errors.report(e)
+        errors.tick()
 
-            elif event.type == SDL_KEYUP:
-                if event.key.keysym.scancode == SDL_SCANCODE_BACKSPACE:
-                    can_down = None
-
-            # a lost focus can swallow the KEYUP — disarm the hold ourselves
-            elif event.type == SDL_WINDOWEVENT:
-                if event.window.event == SDL_WINDOWEVENT_FOCUS_LOST:
-                    can_down = None
-
-            # --- touch / pointer ------------------------------------------
-            # Both families are handled: SDL synthesises mouse events from
-            # touch by default, but that is a hint a kiosk config can turn
-            # off. The SDL_TOUCH_MOUSEID guard is what stops one tap firing
-            # twice while synthesis is on. Finger coords are normalised.
-            elif event.type == SDL_MOUSEBUTTONDOWN:
-                if (event.button.button == SDL_BUTTON_LEFT
-                        and event.button.which != SDL_TOUCH_MOUSEID):
-                    mgr.on_press(event.button.x, event.button.y)
-
-            elif event.type == SDL_MOUSEBUTTONUP:
-                if (event.button.button == SDL_BUTTON_LEFT
-                        and event.button.which != SDL_TOUCH_MOUSEID):
-                    mgr.on_release(event.button.x, event.button.y)
-
-            elif event.type == SDL_MOUSEMOTION:
-                if event.motion.state and event.motion.which != SDL_TOUCH_MOUSEID:
-                    mgr.on_drag(event.motion.x, event.motion.y)
-
-            elif event.type == SDL_FINGERDOWN and finger is None:
-                finger = event.tfinger.fingerId      # ignore a resting palm
-                mgr.on_press(int(event.tfinger.x * mgr.W),
-                             int(event.tfinger.y * mgr.H))
-
-            elif event.type == SDL_FINGERMOTION and event.tfinger.fingerId == finger:
-                mgr.on_drag(int(event.tfinger.x * mgr.W),
-                            int(event.tfinger.y * mgr.H))
-
-            elif event.type == SDL_FINGERUP and event.tfinger.fingerId == finger:
-                finger = None
-                mgr.on_release(int(event.tfinger.x * mgr.W),
-                               int(event.tfinger.y * mgr.H))
-
-        # CAN held past the threshold: wipe the buffer, once per press
-        if can_down is not None and SDL_GetTicks() - can_down >= CAN_HOLD_MS:
-            app.input.clear()
-            can_down = None
-
-        # --- draw -----------------------------------------------------------
-        SDL_SetRenderDrawColor(renderer, *BACKGROUND, 255)
-        SDL_RenderClear(renderer)
-
-        # active screen content + softkey frame/labels + pane
-        mgr.draw(renderer)
-
-        # status bar (drawn over the top band)
-        label_text = f"O{app.prog_num:04d}" if app.prog_num is not None else "O----"
-        draw_line(renderer, font, label_text, 10, 10)
-        draw_line(renderer, font, app.ndisp.text(app.stat), 220, 10)
-
-        t = app.stat.tool_in_spindle
-        draw_line(renderer, font, f"T{t:02d}" if t is not None else "T-", 500, 10)
-        draw_line(renderer, font, WCS[app.stat.g5x_index], 640, 10)
-        draw_line(renderer, font, MODES[app.stat.task_mode], 760, 10)
-        draw_line(renderer, font, app.unit_tag(), 890, 10)
-
-        draw_status_box(renderer, font, 990, 6, 120, 50, "EMG", app.stat.estop)
-
-        # machine clock, right-aligned in the top band
-        clock = datetime.now().strftime("%H:%M:%S")
-        clock_x = WIN_W - 10 - text_width(font, clock)
-        draw_line(renderer, font, clock, clock_x, 10)
-
-        # alarm text is unbounded, so trim it to stop short of the clock
-        latest = app.alarms.latest()
-        if latest is not None:
-            text = latest["text"]
-            avail = clock_x - 20 - 1110
-            while text and text_width(font, text) > avail:
-                text = text[:-1]
-            draw_line(renderer, font, text, 1110, 10, ALARM)
-
+        # always end the frame, even after an exception mid-draw, so the
+        # operator never looks at a frozen screen
         SDL_RenderPresent(renderer)
         SDL_Delay(16)   # ~60 Hz
-        if app.quit:
-            running = False
+
+    try:
+        app.pane.flush()        # keep the last minute of RUN time / parts
+    except Exception as e:
+        errors.report(e)
 
     TTF_CloseFont(font)
     TTF_CloseFont(large_font)

@@ -63,6 +63,12 @@ for the full list, ready to paste.
 - `[DISPLAY]PROGRAM_PREFIX` — program directory (default `~/linuxcnc/nc_files`)
 - `display_units` — persisted; set from the OFFSET → SETTING page
 
+**Parts counter.** For an exact count, wire the HAL input
+`status-pane.part-done` (in `postgui.hal`) to a signal pulsed by M30 or a user
+M-code; each rising edge counts one part, and from the first pulse on the
+GUI's own count is switched off. Without it the GUI counts AUTO cycles that
+end without RESET or an error.
+
 ---
 
 ## SYSTEM screen: ini / hal editor

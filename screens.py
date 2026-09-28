@@ -1301,7 +1301,9 @@ class ProgScreen(Screen):
             self.note = "MACHINE NOT READY"
             return
         try:
-            self.app.mdi(cmd)
+            # async: a long MDI move must not freeze the screen; task
+            # queues further blocks behind it
+            self.app.mdi_async(cmd)
             self.mdi_hist.appendleft(cmd)
         except linuxcnc.error as e:
             self.note = str(e)
@@ -1355,10 +1357,10 @@ class ProgScreen(Screen):
         if st.estop or st.task_state != linuxcnc.STATE_ON:
             self.note = "MACHINE NOT READY"
             return
-        c = self.app.command
-        c.mode(linuxcnc.MODE_AUTO)
-        c.wait_complete()
-        c.auto(linuxcnc.AUTO_RUN, self.rstr_line)
+        try:
+            self.app.run_from_line(self.rstr_line)
+        except linuxcnc.error as e:
+            self.note = str(e)
 
     def _rstr_cancel(self):
         self.rstr_line = None

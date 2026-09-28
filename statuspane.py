@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # statuspane.py — corner status pane per hand sketch.
+#
+# HAL component "status-pane" (optional, created when the hal module loads):
+#   load-x/y/z/a/c/s   FLOAT IN  load bars (EtherCAT torque, % of rated)
+#   home-x/y/z/a/c     BIT IN    POS-screen reference-position indicators
+#   part-done          BIT IN    exact PARTS count: each rising edge counts
+#                                one part; see PART_DONE_PIN below
 
 import os
 import subprocess
@@ -41,6 +47,16 @@ HOME_PINS = {
     "C": "status-pane.home-c",
 }
 
+# Optional exact part count. Wire status-pane.part-done in postgui.hal to a
+# signal pulsed by M30 or a user M-code (e.g. a motion.digital-out-NN set by
+# M64/M65 in the program end). Each rising edge counts one part, and from
+# the first edge on the interpreter-based count below is switched off.
+# Without it the pane counts AUTO cycles that end without RESET or an
+# NML error (App.aborted_since_start).
+PART_DONE_PIN = "status-pane.part-done"
+
+SAVE_PERIOD = 60.0             # s between counter saves while running
+
 
 def _fmt_hms(sec):
     sec = int(sec)
@@ -62,7 +78,11 @@ class StatusPane:
         self.cycle_accum = 0.0     # survives pauses
         self.last_cycle = app.persist.get("last_cycle_seconds", 0.0)
         self.run_mark = time.monotonic()
+        self._last_save = self.run_mark
         self._was_running = False
+        # part-done HAL input: edge detect; once seen, HAL owns the count
+        self._part_done_prev = False
+        self.hal_counts = False
 
         # optional HAL component: load bars + home indicators
         self.hal = None
@@ -75,6 +95,8 @@ class StatusPane:
                 for name in HOME_PINS.values():
                     self.hal.newpin(name.split(".", 1)[1],
                                     hal.HAL_BIT, hal.HAL_IN)
+                self.hal.newpin(PART_DONE_PIN.split(".", 1)[1],
+                                hal.HAL_BIT, hal.HAL_IN)
                 self.hal.ready()
                 self._run_postgui()
             except Exception as e:
@@ -100,6 +122,27 @@ class StatusPane:
         self.app.persist["run_seconds"] = self.run_total
         self.app.persist["last_cycle_seconds"] = self.last_cycle
         self.app.save_persist()
+        self._last_save = time.monotonic()
+
+    def flush(self):
+        """Final save on a normal quit so the last minute of RUN time (and
+        the last cycle) is not lost. Called once by main() after the loop."""
+        now = time.monotonic()
+        self.run_total += now - self.run_mark
+        self.run_mark = now
+        self._save()
+
+    def _part_done(self):
+        """Rising edge on status-pane.part-done (False without HAL)."""
+        if self.hal is None:
+            return False
+        try:
+            val = bool(self.hal[PART_DONE_PIN.split(".", 1)[1]])
+        except Exception:
+            return False
+        edge = val and not self._part_done_prev
+        self._part_done_prev = val
+        return edge
 
     def reset_parts(self):
         self.parts = 0
@@ -111,10 +154,16 @@ class StatusPane:
         st = self.app.stat
         now = time.monotonic()
 
-        # accumulate power-on/run meter (persist every ~60s)
+        # accumulate power-on/run meter (persist every SAVE_PERIOD)
         self.run_total += now - self.run_mark
         self.run_mark = now
-        if int(self.run_total) % 60 == 0:
+        if now - self._last_save >= SAVE_PERIOD:
+            self._save()
+
+        # exact count from HAL; the first pulse hands counting to HAL
+        if self._part_done():
+            self.hal_counts = True
+            self.parts += 1
             self._save()
 
         running = (st.task_mode == linuxcnc.MODE_AUTO
@@ -124,6 +173,7 @@ class StatusPane:
         if running and not self._was_running:          # cycle start
             self.cycle_start = now
             self.cycle_accum = 0.0
+            self.app.aborted_since_start = False
         if running and paused and self.cycle_start is not None:
             self.cycle_accum += now - self.cycle_start  # bank time, stop clock
             self.cycle_start = None
@@ -134,7 +184,10 @@ class StatusPane:
                 self.cycle_accum += now - self.cycle_start
                 self.cycle_start = None
             self.last_cycle = self.cycle_accum          # hold for the next run
-            self.parts += 1                             # M2/M30 completion
+            # M2/M30 completion; a RESET or an NML error during the cycle
+            # is an abort, not a part. HAL part-done overrides this count.
+            if not self.hal_counts and not self.app.aborted_since_start:
+                self.parts += 1
             self._save()
         self._was_running = running
 
