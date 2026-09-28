@@ -7,10 +7,13 @@
 # starts linuxcnc again with the same ini. Without this launcher the RESTRT
 # key reports "NO LAUNCHER".
 #
-#   ./run_gui.sh                      # uses the default ini below
 #   ./run_gui.sh /path/to/machine.ini
-INI="${1:-$HOME/linuxcnc/configs/hmc-sim/hmc-sim.ini}"
-FLAG="${GUI_RESTART_FLAG:-/tmp/linuxcnc-gui-restart}"
+if [ $# -ne 1 ] || [ ! -f "$1" ]; then
+    echo "usage: $0 /path/to/machine.ini" >&2
+    exit 2
+fi
+INI="$1"
+FLAG="${GUI_RESTART_FLAG:-${XDG_RUNTIME_DIR:-/tmp}/linuxcnc-gui-restart}"
 export GUI_RESTART_FLAG="$FLAG"
 
 while :; do

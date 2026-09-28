@@ -15,6 +15,10 @@ import sys
 import linuxcnc
 from sdl2 import SDL_Color
 
+# Font used when [GUI]FONT_PATH is not set. A Debian/Ubuntu-installed font so
+# a stock machine starts; set FONT_PATH in the ini to your panel font.
+DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+
 
 def _parse_ini_arg(argv):
     """LinuxCNC launches DISPLAY programs as: prog -ini /path/to/file.ini"""

@@ -3,7 +3,6 @@
 
 import os
 import re
-import sys
 import json
 import ctypes
 from sdl2 import *
@@ -15,19 +14,17 @@ from statuspane import StatusPane
 import linuxcnc
 import settings
 
-from screens import (render_text, blit_text, draw_line, text_width,
-                     InputBuffer, FieldCursor,
+from screens import (draw_line, text_width, InputBuffer,
                      PosScreen, ProgScreen, OffsetScreen,
                      MessageScreen, GraphicsScreen,
-                     ScreenManager, WCS, AXIS_IDX, PANE_W)
+                     ScreenManager, WCS)
 from systemscreen import SystemScreen
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 WIN_W, WIN_H = 1920, 1080
-FONT_PATH = settings.get_path("GUI", "FONT_PATH",
-                              "/usr/share/fonts/truetype/dejavu/ISOCPEUR.TTF")
+FONT_PATH = settings.get_path("GUI", "FONT_PATH", settings.DEFAULT_FONT)
 FONT_SIZE = settings.get_int("GUI", "FONT_SIZE", 48)
 LARGE_FONT_SIZE = settings.get_int("GUI", "LARGE_FONT_SIZE", 180)
 
@@ -208,7 +205,7 @@ class App:
         self.always_show_position = settings.get_bool(
             "GUI", "ALWAYS_SHOW_POSITION", True)
         self.pane = None
-        self.quit = False                   # set by SYSTEM -> EXIT -> EXEC                    # set after renderer exists
+        self.quit = False                   # set by SYSTEM -> EXIT -> EXEC
         self.axes = settings.get_str("GUI", "AXES", "XYZAC")   # "XYZ" for 3-axis
         self.rel_origin = [0.0] * 9         # machine units, 9-tuple indexed
 

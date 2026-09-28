@@ -33,7 +33,7 @@ import settings
 from ioview import IoModel, IoView
 from screens import (Screen, K, FieldCursor, draw_line, text_width,
                      WHITE, RED, BLACK, DIM, ACCENT, KEY_HILITE,
-                     SOFTKEY_Y, BUFFER_H, ENTRY)
+                     SOFTKEY_Y, BUFFER_H)
 
 RESTART_FLAG_ENV = "GUI_RESTART_FLAG"     # exported by run_gui.sh
 

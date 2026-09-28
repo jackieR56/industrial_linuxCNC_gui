@@ -29,8 +29,7 @@ ALARM_C   = settings.color("ALARM", (250, 0, 0))
 DIM_C     = settings.color("DIM", (150, 150, 150))
 INV_C     = settings.color("TEXT_INVERSE", (0, 0, 0))    # rect on a lit cursor
 
-FONT_PATH = settings.get_path("GUI", "FONT_PATH",
-                              "/usr/share/fonts/truetype/dejavu/ISOCPEUR.TTF")
+FONT_PATH = settings.get_path("GUI", "FONT_PATH", settings.DEFAULT_FONT)
 IO_FONT_SIZE = settings.get_int("GUI", "IO_FONT_SIZE", 30)
 IO_SAMPLE_MS = settings.get_int("GUI", "IO_SAMPLE_MS", 50)
 IO_MAP = settings.get_str("GUI", "IO_MAP", "io_map.yaml")

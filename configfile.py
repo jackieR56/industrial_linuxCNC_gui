@@ -267,7 +267,7 @@ class HalDoc(LineDoc):
         def cell(label, lo, hi, editable=True):
             hi_ = n if hi is None else min(hi, n)
             return Cell(label, " ".join(t[lo:hi_]), editable and not ro,
-                        lo, hi if hi is None else hi)
+                        lo, hi)
 
         c = rec.cmd
         if rec.kind != "cmd":

@@ -89,7 +89,6 @@ class PlotCanon:
     def get_axis_mask(self):              return self.stat.axis_mask
     def get_external_angular_units(self): return self.stat.angular_units or 1.0
     def get_external_length_units(self):  return self.stat.linear_units or 1.0
-    def get_external_length_units(self):  return self.stat.linear_units or 1.0
     def get_tool(self, pocket):
         try:
             t = self.stat.tool_table[pocket]

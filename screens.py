@@ -40,7 +40,7 @@ WEAR_FILE = os.path.join(os.path.dirname(__file__), "tool_wear.json")
 # Probe macros. LinuxCNC resolves these by SUBROUTINE_PATH when it runs them;
 # we only read them here, to show the operator the routine's own placement
 # instructions rather than a generic "position the probe" line.
-MACRO_DIR = os.path.join(os.path.dirname(__file__), "macros", "macros")
+MACRO_DIR = os.path.join(os.path.dirname(__file__), "macros")
 
 _MACRO_META  = re.compile(r"^(author|version|date)\s*:", re.I)
 _MACRO_BOILER = "ensure all settings"
