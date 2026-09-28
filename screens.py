@@ -5,7 +5,6 @@
 import ctypes
 import math
 import re
-import shutil
 from collections import deque
 from sdl2 import *
 from sdl2.sdlttf import *
@@ -14,6 +13,7 @@ import linuxcnc
 import json
 import os
 import settings
+import configfile
 
 WHITE = settings.sdl_color("TEXT", (255, 255, 255))
 RED   = settings.sdl_color("ALARM", (250, 0, 0))
@@ -1065,7 +1065,7 @@ class ProgScreen(Screen):
                 K("REFRSH", self._refresh_files),
             ]
             if self.chapter == "USB":
-                keys.insert(3, K("READ", lambda: self._confirm(self._file_read)))
+                keys.insert(3, K("READ", self._file_read_menu))
             else:
                 keys.insert(3, K("PUNCH", lambda: self._confirm(self._file_punch)))
             self.push(keys)
@@ -1171,6 +1171,7 @@ class ProgScreen(Screen):
             self.chapter = "PRGRM"
             self.set_root(self._root_row())
             return
+        self.edit_path = st.file         # the file actually opened
         try:
             with open(st.file) as f:
                 self.edit_lines = [l.rstrip("\n") for l in f.readlines()]
@@ -1264,10 +1265,17 @@ class ProgScreen(Screen):
         self._clamp_word()
 
     def _edit_save(self):
-        path = self.app.stat.file
+        st = self.app.stat
+        if st.interp_state != linuxcnc.INTERP_IDLE:
+            self.note = "CANNOT SAVE - PROGRAM RUNNING"
+            return
+        path = getattr(self, "edit_path", None)
+        if not path or st.file != path:
+            self.note = "PROGRAM CHANGED - SAVE CANCELLED"
+            return
         try:
-            with open(path, "w") as f:
-                f.write("\n".join(self.edit_lines) + "\n")
+            configfile.atomic_write(path, "\n".join(self.edit_lines) + "\n",
+                                    backup=True)
         except OSError as e:
             self.note = f"SAVE FAILED: {e}"
             return
@@ -1385,7 +1393,7 @@ class ProgScreen(Screen):
             self.set_root(self._root_row())
             return
         base = self.usb_path if self.chapter == "USB" else self.dir_path
-        if not base or not base.startswith(root):
+        if not base or not (base == root or base.startswith(root + os.sep)):
             base = root
         try:
             names = sorted(os.listdir(base), key=str.upper)
@@ -1454,8 +1462,8 @@ class ProgScreen(Screen):
             self.note = "ALREADY EXISTS"
             return
         try:
-            with open(path, "w") as f:
-                f.write("( NEW PROGRAM )\nM2\n")
+            configfile.atomic_write(path, "( NEW PROGRAM )\nM2\n",
+                                    backup=False)
         except OSError as e:
             self.note = f"CREATE FAILED: {e}"
             return
@@ -1466,6 +1474,10 @@ class ProgScreen(Screen):
         e = self._cur_entry()
         if not e or e[1]:                # never delete directories
             return
+        # the loaded-but-idle program may go (LinuxCNC keeps its copy)
+        if self._is_running_file(e[2]):
+            self.note = "CANNOT DELETE RUNNING PROGRAM"
+            return
         try:
             os.remove(e[2])
             self.note = f"DELETED {e[0]}"
@@ -1473,17 +1485,52 @@ class ProgScreen(Screen):
             self.note = f"DELETE FAILED: {err}"
         self._refresh_files()
 
+    def _is_running_file(self, path):
+        """True when `path` is the loaded program and the interpreter is
+        not idle."""
+        st = self.app.stat
+        return (bool(st.file) and path == st.file
+                and st.interp_state != linuxcnc.INTERP_IDLE)
+
+    def _file_read_menu(self):
+        """USB page READ softkey: warn about overwrite, then confirm."""
+        e = self._cur_entry()
+        if not e or e[1]:
+            return
+        dst = os.path.join(self.app.prog_dir, e[0])
+        if os.path.exists(dst):
+            self.note = f"READ {e[0]} -> DIR, OVERWRITES EXISTING"
+        else:
+            self.note = f"READ {e[0]} -> DIR"
+        self._confirm(self._file_read)
+
     def _file_read(self):
         """USB page: copy cursored file USB -> program directory."""
         e = self._cur_entry()
         if not e or e[1]:
             return
         dst = os.path.join(self.app.prog_dir, e[0])
+        if self._is_running_file(dst):
+            self.note = "CANNOT OVERWRITE RUNNING PROGRAM"
+            return
+        if os.path.exists(dst):
+            try:
+                configfile.rotate_backups(dst)
+            except OSError as err:
+                self.note = f"READ FAILED: BACKUP: {err}"
+                return
         try:
-            shutil.copy(e[2], dst)
+            configfile.copy_and_sync(e[2], dst)
             self.note = f"READ {e[0]} -> DIR"
         except OSError as err:
             self.note = f"READ FAILED: {err}"
+            return
+        if dst == self.app.stat.file:
+            # idle and loaded: reopen so LinuxCNC's copy matches the file
+            try:
+                self.app.reload_program(dst)
+            except linuxcnc.error as err:
+                self.note = f"READ {e[0]} -> DIR, RELOAD FAILED: {err}"
 
     def _file_punch(self):
         """DIR page: copy cursored file program directory -> first USB."""
@@ -1499,7 +1546,8 @@ class ProgScreen(Screen):
             self.note = "NO USB MOUNTED"
             return
         try:
-            shutil.copy(e[2], os.path.join(usb, e[0]))
+            configfile.copy_and_sync(e[2], os.path.join(usb, e[0]))
+            os.sync()
             self.note = f"PUNCH {e[0]} -> USB"
         except OSError as err:
             self.note = f"PUNCH FAILED: {err}"

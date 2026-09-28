@@ -23,7 +23,6 @@
 
 import os
 import re
-import shutil
 
 import linuxcnc
 from sdl2 import *
@@ -480,7 +479,8 @@ class SystemScreen(Screen):
             self.note = "NO USB MOUNTED"
             return
         try:
-            shutil.copy(e[2], os.path.join(usb, e[0]))
+            configfile.copy_and_sync(e[2], os.path.join(usb, e[0]))
+            os.sync()
             self.note = f"COPIED {e[0]} -> USB"
         except OSError as err:
             self.note = f"COPY FAILED: {err.strerror or err}"
