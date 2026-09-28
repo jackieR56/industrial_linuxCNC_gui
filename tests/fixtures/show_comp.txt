@@ -1,0 +1,5 @@
+    36  User  halcmd12345          12345  ready
+    33  User  vpanel                4321  ready
+    10  RT    lcec                        ready
+    11  RT    trivkins                    ready
+junk

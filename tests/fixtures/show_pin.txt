@@ -1,0 +1,8 @@
+lcec bit OUT TRUE lcec.0.D1.din-0 ==> cycle-start
+lcec bit OUT FALSE lcec.0.D1.din-1
+lcec float OUT 1.5 lcec.0.G2.analog
+lcec s32 OUT 0x0000002A lcec.0.G2.count
+iocontrol bit OUT TRUE iocontrol.0.user-enable-out ==> estop-loop
+iocontrol bit IN TRUE iocontrol.0.emc-enable-in <== estop-loop
+halui bit IN FALSE halui.program.run <== cycle-start
+short row

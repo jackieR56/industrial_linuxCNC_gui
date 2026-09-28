@@ -9,12 +9,19 @@
 # newline). configparser is deliberately not used: LinuxCNC inis repeat
 # keys ([HAL]HALFILE) and configparser would drop comments.
 #
+# Saving is atomic: temp file in the same directory, fsync, rename over
+# the target, fsync the directory (atomic_write / copy_and_sync), so a
+# power cut leaves either the old or the new file, never a partial one.
+# Each save first rotates numbered backups: <file>.bak is the newest,
+# then .bak.1 ... .bak.4 (keep=5); restore_backup() puts .bak back.
+#
 # No SDL imports here — this module is unit-testable on its own.
 
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 
 # ---------------------------------------------------------------------------
@@ -352,23 +359,142 @@ def load_doc(path, ini=None):
 
 
 def backup_path(path):
+    """Newest backup of `path` (what restore_backup() restores)."""
     return path + ".bak"
 
 
+def _backup_names(path, keep=5):
+    """[<path>.bak, <path>.bak.1, ... <path>.bak.{keep-1}], newest first."""
+    return [path + ".bak"] + [f"{path}.bak.{n}" for n in range(1, max(keep, 1))]
+
+
+def rotate_backups(path, keep=5):
+    """Shift the numbered backups down one slot (.bak.{keep-2} -> .bak.{keep-1}
+    ... .bak -> .bak.1; the oldest falls off) and copy `path` to .bak.
+    Missing intermediates are skipped. keep counts all slots including .bak.
+    Raises OSError."""
+    names = _backup_names(path, keep)
+    for k in range(len(names) - 1, 0, -1):
+        if os.path.exists(names[k - 1]):
+            os.replace(names[k - 1], names[k])
+    shutil.copy2(path, names[0])
+
+
+def list_backups(path, keep=None):
+    """Existing backup paths of `path`, newest first (.bak, .bak.1, ...).
+    Gaps are skipped; keep limits the numbered slots to < keep."""
+    out = [path + ".bak"] if os.path.exists(path + ".bak") else []
+    d = os.path.dirname(path) or "."
+    base = os.path.basename(path) + ".bak."
+    nums = []
+    try:
+        for n in os.listdir(d):
+            if n.startswith(base) and n[len(base):].isdigit():
+                nums.append(int(n[len(base):]))
+    except OSError:
+        return out
+    for k in sorted(nums):
+        if keep is None or k < keep:
+            out.append(f"{path}.bak.{k}")
+    return out
+
+
+def _fsync_dir(d):
+    """fsync a directory so a rename in it is durable. Some filesystems
+    (vfat on USB sticks, some network mounts) refuse: ignored."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _copy_mode(path, tmp):
+    """mkstemp makes 0600 files: give tmp the target's mode (or the umask
+    default for a new file) so a save never changes permissions."""
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        um = os.umask(0)
+        os.umask(um)
+        mode = 0o666 & ~um
+    os.chmod(tmp, mode)
+
+
+def _atomic_replace(path, write):
+    """Temp file in path's directory, write(f) into it, flush + fsync,
+    rename over `path`, fsync the directory. On any failure the temp file
+    is removed and the error re-raised; `path` is never left partial.
+    write(f) receives the raw fd and returns nothing."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".",
+                               suffix=".tmp")
+    try:
+        _copy_mode(path, tmp)
+        write(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(d)
+
+
+def atomic_write(path, text, backup=True, keep=5, encoding="utf-8",
+                 errors="surrogateescape", newline=""):
+    """Write `text` to `path` atomically (temp + fsync + rename + dir fsync).
+    With backup and an existing file, rotate_backups(path, keep) first.
+    Raises OSError."""
+    if backup and os.path.exists(path):
+        rotate_backups(path, keep)
+
+    def write(fd):
+        with open(fd, "w", encoding=encoding, errors=errors,
+                  newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+    _atomic_replace(path, write)
+
+
+def _write_bytes(data):
+    def write(fd):
+        with open(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    return write
+
+
+def copy_and_sync(src, dst):
+    """Copy src -> dst byte for byte through temp + rename, fsyncing the
+    file and dst's directory (USB sticks). No backup rotation. Raises
+    OSError."""
+    with open(src, "rb") as f:
+        data = f.read()
+    _atomic_replace(dst, _write_bytes(data))
+
+
 def write_with_backup(path, text):
-    """<path>.bak = previous content, then atomic replace. Raises OSError."""
-    if os.path.exists(path):
-        shutil.copy2(path, backup_path(path))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", errors="surrogateescape",
-              newline="") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """Rotate numbered backups (.bak newest ... .bak.4), then atomic
+    replace. Raises OSError."""
+    atomic_write(path, text, backup=True)
 
 
 def restore_backup(path):
-    """Copy <path>.bak over <path>. Raises FileNotFoundError / OSError."""
-    shutil.copy2(backup_path(path), path)
+    """Atomically put <path>.bak back over <path> (no rotation). Raises
+    FileNotFoundError when there is no .bak, OSError otherwise."""
+    with open(backup_path(path), "rb") as f:
+        data = f.read()
+    _atomic_replace(path, _write_bytes(data))
 
 
 # ---------------------------------------------------------------------------

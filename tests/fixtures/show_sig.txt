@@ -1,0 +1,4 @@
+bit TRUE estop-loop <== iocontrol.0.user-enable-out ==> iocontrol.0.emc-enable-in
+bit FALSE cycle-start <== lcec.0.D1.din-0 ==> halui.program.run ==> foo.0.run
+float 400 max-vel
+==> stray-arrow-row

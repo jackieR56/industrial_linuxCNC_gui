@@ -1,0 +1,16 @@
+# io.hal - test fixture
+loadrt foo \
+  bar=1
+loadrt trivkins
+loadusr -Wn vpanel vpanel.py --sim
+loadusr -W lcec_conf ethercat-conf.xml
+addf foo.0 servo-thread
+
+# ======== MODE
+net estop-loop  iocontrol.0.user-enable-out => iocontrol.0.emc-enable-in   # estop chain
+setp foo.0.gain 1.5
+setp "foo.0.quoted name" 2
+net max-vel [TRAJ]MAX_LINEAR_VELOCITY => foo.0.max
+# ---- hard panel DI
+net cycle-start lcec.0.D1.din-0 => halui.program.run  # green button
+   # indented comment
