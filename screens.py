@@ -1018,6 +1018,9 @@ class ProgScreen(Screen):
         if not name.upper().endswith(".NGC"):
             name += ".ngc"
         base = self._browser().path
+        if not base or not os.path.isdir(base):    # USB pulled / never there
+            self.note = "NO USB MOUNTED" if self.chapter == "USB" else "DIRECTORY MISSING"
+            return
         path = os.path.join(base, name)
         if os.path.exists(path):
             self.note = "ALREADY EXISTS"
