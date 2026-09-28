@@ -1,5 +1,16 @@
 o<tool_length> sub
 
+; Tool length measurement on a fixed tool setter.
+;
+; Reads [TOOLSETTER] X, Y, Z_SAFE, Z_START, MAXPROBE, SEARCH_VEL, PROBE_VEL,
+; BACKOFF, Z_REF from the ini (all machine units) and optionally PROBE_INPUT
+; (a motion.digital-in number wired to the setter contact).
+;
+; Writes the MEASURED length with G10 L1. The GUI re-applies any tool wear
+; it holds for the tool after this macro returns, so wear must not be added
+; here. G52 is covered by the G92 term below (#5210/#5213 hold the combined
+; G92/G52 offset); XY rotation (G10 L2 R) does not affect Z.
+
 ; skip in the GUI preview interpreter; only run in task
 o10 if [#<_task> EQ 0]
 o10     return
@@ -15,10 +26,25 @@ o30 if [#<_metric_machine> NE #<_metric>]
     (abort, Switch to machine units G20/G21 before measuring)
 o30 endif
 
+; save modal state (distance mode, feed, plane, units...); M72 restores it
+M70
+
 G49
 G90
 G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
 G53 G0 X[#<_ini[TOOLSETTER]X>] Y[#<_ini[TOOLSETTER]Y>]
+
+; optional pre-check: a setter that is already tripped (stuck, crashed, or a
+; tool longer than Z_START allows) must not be driven into. #5399 is M66's
+; result; wait mode 0 reads the input immediately.
+o35 if [EXISTS[#<_ini[TOOLSETTER]PROBE_INPUT>]]
+    M66 P[#<_ini[TOOLSETTER]PROBE_INPUT>] L0
+    o36 if [#5399 GT 0]
+        M72
+        (abort, Toolsetter already tripped - check setter and tool)
+    o36 endif
+o35 endif
+
 G53 G0 Z[#<_ini[TOOLSETTER]Z_START>]
 
 ; fast search
@@ -27,6 +53,7 @@ G38.3 Z-[#<_ini[TOOLSETTER]MAXPROBE>] F[#<_ini[TOOLSETTER]SEARCH_VEL>]
 o40 if [#5070 EQ 0]
     G90
     G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+    M72
     (abort, Toolsetter not tripped on search)
 o40 endif
 
@@ -36,6 +63,7 @@ G38.3 Z-[#<_ini[TOOLSETTER]BACKOFF> * 2] F[#<_ini[TOOLSETTER]PROBE_VEL>]
 o50 if [#5070 EQ 0]
     G90
     G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+    M72
     (abort, Toolsetter not tripped on slow probe)
 o50 endif
 G90
@@ -46,6 +74,10 @@ G90
 
 G10 L1 P#<tool> Z#<len>
 G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+
+; restore the caller's modals (G49 was forced above), then apply the new
+; length: G43 after M72 so the restore cannot undo it
+M72
 G43
 
 ;(DEBUG, T#<tool> trip machine Z = #<trip_mz> length = #<len>)
