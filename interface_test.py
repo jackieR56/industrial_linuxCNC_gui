@@ -19,7 +19,16 @@ from statuspane import StatusPane
 
 import linuxcnc
 import settings
+
+# Import-time side effect, deliberately BEFORE anything can start a backplot
+# parse worker: the gcode preview interpreter reads INI_FILE_NAME from the
+# environment (the linuxcnc launcher sets it; a GUI started from its own
+# terminal does not). Backplot2D's worker must not touch os.environ itself.
+if settings.INI_PATH:
+    os.environ.setdefault("INI_FILE_NAME", settings.INI_PATH)
+
 import configfile
+import units
 
 from screens import (draw_line, text_width, InputBuffer,
                      PosScreen, ProgScreen, OffsetScreen,
@@ -270,7 +279,7 @@ class ErrorReporter:
 # the display/entry membrane via the helpers below.
 # ---------------------------------------------------------------------------
 class App:
-    LINEAR_AXES = "XYZUVW"          # rotary axes (A/B/C) never unit-convert
+    LINEAR_AXES = units.LINEAR_AXES  # rotary axes (A/B/C) never unit-convert
 
     def __init__(self):
         self.stat = linuxcnc.stat()
@@ -480,41 +489,36 @@ class App:
         self.save_persist()
 
     # ------------------------------------------------------------- units
+    # thin wrappers over units.py (pure, unit-tested) fed from live stat
+    def _machine_mm(self):
+        return self.stat.linear_units == 1.0
+
+    def _program_mm(self):
+        return self.stat.program_units == 2
+
     def unit_factor(self):
         """Multiply machine-unit linear values by this for display."""
-        du = self.display_units
-        if du == "MM":      want_mm = True
-        elif du == "INCH":  want_mm = False
-        elif du == "PROGRAM":
-            want_mm = (self.stat.program_units == 2)
-        else:                                        # MACHINE
-            return 1.0
-        machine_mm = (self.stat.linear_units == 1.0)
-        if machine_mm == want_mm:
-            return 1.0
-        return 1 / 25.4 if machine_mm else 25.4
+        return units.unit_factor(self.display_units, self._machine_mm(),
+                                 self._program_mm())
 
     def unit_tag(self):
-        f = self.unit_factor()
-        machine_mm = (self.stat.linear_units == 1.0)
-        shown_mm = machine_mm if f == 1.0 else not machine_mm
-        return "MM" if shown_mm else "INCH"
+        return units.unit_tag(self.display_units, self._machine_mm(),
+                              self._program_mm())
 
     def machine_to_interp(self, v):
         """Machine-unit linear value -> value for a G10/MDI word, which the
         interpreter reads in its *current* (G20/G21) units."""
-        machine_mm = self.stat.linear_units == 1.0
-        interp_mm = self.stat.program_units == 2
-        if machine_mm == interp_mm:
-            return v
-        return v / 25.4 if machine_mm else v * 25.4
+        return units.machine_to_interp(v, self._machine_mm(),
+                                       self._program_mm())
 
     def disp_to_machine(self, ax, typed):
         """Typed display-unit value -> machine units (rotary passes through)."""
-        return typed / self.unit_factor() if ax in self.LINEAR_AXES else typed
+        return units.disp_to_machine(typed, self.unit_factor(),
+                                     ax in self.LINEAR_AXES)
 
     def machine_to_disp(self, ax, v):
-        return v * self.unit_factor() if ax in self.LINEAR_AXES else v
+        return units.machine_to_disp(v, self.unit_factor(),
+                                     ax in self.LINEAR_AXES)
 
     def fmt_axis(self, ax, machine_val, width=9, prec=4):
         """Machine-unit value -> display string in current display units."""
@@ -755,9 +759,6 @@ def main():
     SDL_DestroyWindow(window)
     TTF_Quit()
     SDL_Quit()
-
-if settings.INI_PATH:
-    os.environ.setdefault("INI_FILE_NAME", settings.INI_PATH)
 
 if __name__ == "__main__":
     main()

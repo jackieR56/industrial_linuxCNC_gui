@@ -235,6 +235,9 @@ class Backplot2D:
         self._thread = None
         self._results = queue.Queue()
         self._canon = None        # in-flight canon, for loading_count
+        # (ini_filename, live_var_path, startup_code), read on the main
+        # thread in load(); the worker never opens the ini itself
+        self._ini_cache = None
 
     # ------------------------------------------------------------------ parse
     SNAP_FIELDS = ("file", "ini_filename", "linear_units", "angular_units",
@@ -250,6 +253,8 @@ class Backplot2D:
         # the main loop keeps polling live stat, so the worker gets a copy
         snap = types.SimpleNamespace(
             **{f: getattr(stat, f) for f in self.SNAP_FIELDS})
+        _, snap.parameter_file, snap.startup_code = self._ini_values(
+            snap.ini_filename)
         self._gen += 1
         if self._thread is not None:
             # gcode.parse is not reentrant; the bumped gen makes the old
@@ -260,6 +265,18 @@ class Backplot2D:
         self._thread = threading.Thread(target=self._parse_worker,
                                         args=(snap, self._gen), daemon=True)
         self._thread.start()
+
+    def _ini_values(self, ini_filename):
+        """Main thread: PARAMETER_FILE (absolute) and RS274NGC_STARTUP_CODE,
+        cached per ini_filename."""
+        c = self._ini_cache
+        if c is None or c[0] != ini_filename:
+            ini = linuxcnc.ini(ini_filename)
+            var = ini.find("RS274NGC", "PARAMETER_FILE") or "linuxcnc.var"
+            var = os.path.join(os.path.dirname(ini_filename), var)
+            startup = ini.find("RS274NGC", "RS274NGC_STARTUP_CODE") or ""
+            c = self._ini_cache = (ini_filename, var, startup)
+        return c
 
     def invalidate(self):
         """Force a re-parse (program reloaded); cancels any in-flight parse."""
@@ -294,14 +311,16 @@ class Backplot2D:
             self.rebake()
 
     def _parse_worker(self, stat, gen):
-        """Worker thread: gcode.parse into a segment list. No SDL here."""
+        """Worker thread: gcode.parse into a segment list. No SDL here.
+        Reads only the `stat` snapshot built by load() — no live stat, no
+        ini, no os.environ writes. INI_FILE_NAME (read by the preview
+        interpreter) is set at import time in interface_test.py, right
+        after `import settings`, before any worker can start."""
         path = stat.file
         error = None
 
         # scratch copy of the parameter file so parse can't clobber live params
-        ini = linuxcnc.ini(stat.ini_filename)
-        live_var = ini.find("RS274NGC", "PARAMETER_FILE") or "linuxcnc.var"
-        live_var = os.path.join(os.path.dirname(stat.ini_filename), live_var)
+        live_var = stat.parameter_file
         tmp_var = tempfile.NamedTemporaryFile(suffix=".var", delete=False)
         tmp_var.close()
         try:
@@ -312,10 +331,6 @@ class Backplot2D:
         canon = PlotCanon(stat, tmp_var.name,
                           cancelled=lambda: gen != self._gen)
         self._canon = canon
-        # The preview interpreter reads INI_FILE_NAME from the environment.
-        # Axis inherits it from the linuxcnc launcher; a GUI started from its
-        # own terminal does not have it — set it explicitly.
-        os.environ["INI_FILE_NAME"] = stat.ini_filename
         # Seed the starting coordinate frame from LIVE stat, not the disk var:
         # the var file is flushed lazily, so offsets/rotation set via MDI can
         # be stale on disk while active on the machine. Stat offsets are
@@ -328,7 +343,7 @@ class Backplot2D:
         #       f"prog_units={stat.program_units} k={canon.k:.4f}")
 
         unitcode = "G%d" % (20 + (stat.linear_units == 1))     # mm machine -> G21
-        initcode = ini.find("RS274NGC", "RS274NGC_STARTUP_CODE") or ""
+        initcode = stat.startup_code
 
         try:
             result, seq = gcode.parse(path, canon, unitcode, initcode)
