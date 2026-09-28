@@ -8,6 +8,7 @@
 #                                one part; see PART_DONE_PIN below
 
 import os
+import re
 import subprocess
 import time
 import linuxcnc
@@ -184,12 +185,20 @@ class StatusPane:
                 self.cycle_accum += now - self.cycle_start
                 self.cycle_start = None
             self.last_cycle = self.cycle_accum          # hold for the next run
-            # M2/M30 completion; a RESET or an NML error during the cycle
-            # is an abort, not a part. HAL part-done overrides this count.
-            if not self.hal_counts and not self.app.aborted_since_start:
+            # A part is an M2/M30 completion. Measured on a sim: after M30
+            # stat.command still holds the last block ("M30"); after an
+            # abort or E-stop from ANY source (GUI RESET, halui.abort, a
+            # panel E-stop) task clears it to "". aborted_since_start
+            # (GUI RESET / NML error) is kept as a second guard. HAL
+            # part-done overrides this count.
+            ended_ok = bool(self._END_RE.search(st.command or ""))
+            if (not self.hal_counts and ended_ok
+                    and not self.app.aborted_since_start):
                 self.parts += 1
             self._save()
         self._was_running = running
+
+    _END_RE = re.compile(r"(?<![A-Za-z0-9.])[Mm]0*(2|30)(?![0-9.])")
 
     def cycle_seconds(self):
         t = self.cycle_accum
