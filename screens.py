@@ -13,10 +13,19 @@ from backplot import Backplot2D, AXIS_COLORS
 import linuxcnc
 import json
 import os
+import settings
 
-WHITE = SDL_Color(255, 255, 255)
-RED   = SDL_Color(250, 0, 0)
-BLACK = SDL_Color(0, 0, 0)
+WHITE = settings.sdl_color("TEXT", (255, 255, 255))
+RED   = settings.sdl_color("ALARM", (250, 0, 0))
+BLACK = settings.sdl_color("TEXT_INVERSE", (0, 0, 0))   # text on a lit fill
+DIM    = settings.sdl_color("DIM", (150, 150, 150))
+ACCENT = settings.sdl_color("ACCENT", (255, 150, 40))
+
+BG_C       = settings.color("BACKGROUND", (0, 0, 0))
+FRAME_C    = settings.color("FRAME", (0, 0, 255))        # softkey frame
+CURSOR_C   = settings.color("CURSOR_CELL", (60, 60, 60)) # probe grid cursor
+GRID_ON_C  = settings.color("GRID_ON", (27, 95, 165))    # probe cell, populated
+GRID_OFF_C = settings.color("GRID_OFF", (45, 45, 45))    # probe cell, empty
 
 STATUS_H  = 60          # content starts below this
 SOFTKEY_Y = 960         # softkey frame line
@@ -41,7 +50,7 @@ _macro_help_cache = {}
 def macro_help(name):
     """The leading comment block of macros/<name>.ngc, minus the metadata and
     the boilerplate trailer. [0] is what the routine does, [1:] is where to
-    put the probe. Empty when the macro has no header (tool_sensor) or cannot
+    put the probe. Empty when the macro has no header (tool_length) or cannot
     be read — this is called from the draw loop, so it must not raise."""
     if name in _macro_help_cache:
         return _macro_help_cache[name]
@@ -200,14 +209,16 @@ CAL_FIELDS = {
     "probe_cal_square_pocket": ("x_hint", "y_hint", "cal_x_width", "cal_y_width"),
 }
 
-FEAT_C  = (60, 200, 90)     # green:  workpiece faces
-START_C = (250, 60, 60)     # red:    probe start position
-PATH_C  = (180, 120, 230)   # purple: probe motion
+FEAT_C  = settings.color("PROBE_FEATURE", (60, 200, 90))   # workpiece faces
+START_C = settings.color("PROBE_START", (250, 60, 60))     # probe start position
+PATH_C  = settings.color("PROBE_PATH", (180, 120, 230))    # probe motion
 
-TOOL_SENSOR_MACRO = "tool_sensor"
+# tool length probe diagram
+
+TOOL_SENSOR_MACRO = "tool_length"
 
 # POS-screen home indicators (fed by the status-pane HAL bit pins)
-HOME_C = (255, 255, 255)        # datum mark: axis at its reference position
+HOME_C = settings.color("HOME_MARK", (255, 255, 255))   # datum mark: axis at its reference position
 
 
 # ---------------------------------------------------------------------------
@@ -520,11 +531,21 @@ class InputBuffer:
     """Global key buffer. Fed by SDL_TEXTINPUT, always uppercase."""
     ALLOWED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789()?,@#=*-.[]&+/; ")
     MAXLEN = 64
+    MAXLEN_RAW = 240                  # loadrt names= lists run long
 
     def __init__(self):
         self.text = ""
+        # raw: keep case and accept every printable ASCII char. Turned on by
+        # the SYSTEM editor pages (hal pin names and paths are case-sensitive)
+        # and off again when that screen is left.
+        self.raw = False
 
     def feed(self, s):                # printable chars from SDL_TEXTINPUT
+        if self.raw:
+            for ch in s:
+                if 32 <= ord(ch) < 127 and len(self.text) < self.MAXLEN_RAW:
+                    self.text += ch
+            return
         for ch in s.upper():
             if ch in self.ALLOWED and len(self.text) < self.MAXLEN:
                 self.text += ch
@@ -604,7 +625,7 @@ def draw_field(renderer, font, text, i, cursor, pad=6):
     """Draw one field; reverse-video if the cursor is on it."""
     f = cursor.fields[i]
     if cursor.is_current(i):
-        SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+        SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
         SDL_RenderFillRect(renderer, SDL_Rect(f.x, f.y, f.w, f.h))
         draw_line(renderer, font, text, f.x + pad, f.y + 2, BLACK)
     else:
@@ -631,6 +652,10 @@ KEY_KIND = {
     "XY": PAGE, "XZ": PAGE, "YZ": PAGE, "ISO": PAGE,
     "ZOOM+": PAGE, "ZOOM-": PAGE, "<-": PAGE, "->": PAGE, "UP": PAGE,
     "DOWN": PAGE, "FIT": PAGE, "REDRAW": PAGE,
+    "TEXT": PAGE, "FIELDS": PAGE, "INFO": PAGE, "PINS": PAGE,
+    "SEC \\/": PAGE, "SEC /\\": PAGE,
+    "PHYS": PAGE, "HAL": PAGE, "GRP \\/": PAGE, "GRP /\\": PAGE,
+    "HOLD": PAGE, "LOG": PAGE,
     # data entry / search / edit — consume the typed buffer or move a cursor
     "INPUT": ENTRY, "+INPUT": ENTRY, "INP.C.": ENTRY,
     "O SRH": ENTRY, "N SRH": ENTRY, "NO.SRH": ENTRY, "SEARCH": ENTRY,
@@ -641,18 +666,26 @@ KEY_KIND = {
     "EXEC": ACT, "MEASUR": ACT, "Z.PRB": ACT, "SELECT": ACT, "SAVE": ACT,
     "READ": ACT, "PUNCH": ACT, "DELETE": ACT, "NEW": ACT, "REFRSH": ACT,
     "REWIND": ACT, "ORIGIN": ACT, "PTSPRE": ACT, "EXIT": ACT,
+    "APPLY": ACT, "COPY": ACT, "RESTOR": ACT, "RESTRT": ACT,
+    "REGEN": ACT,
     # menus and back-outs
     "(OPRT)": MENU, "CLEAR": MENU, "CAN": MENU, "CANCEL": MENU,
     "RETURN": MENU, "<": MENU, ">": MENU,
+    "CLR.CNT": MENU,
 }
 
 KEY_COLORS = {
-    PAGE:  SDL_Color(0, 100, 255),   # cyan   — changes what's displayed
-    ENTRY: SDL_Color(0, 255, 0),   # green  — consumes the typed buffer
-    ACT:   SDL_Color(255, 0, 0),    # orange — commands machine / files
-    MENU:  WHITE,                      # menus, cancel, back
+    PAGE:  settings.sdl_color("KEY_PAGE", (0, 100, 255)),   # changes what's displayed
+    ENTRY: settings.sdl_color("KEY_ENTRY", (0, 255, 0)),   # consumes the typed buffer
+    ACT:   settings.sdl_color("KEY_ACT", (255, 0, 0)),     # commands machine / files
+    MENU:  settings.sdl_color("KEY_MENU", (255, 255, 255)), # menus, cancel, back
 }
-KEY_HILITE = (230, 230, 230)           # active-key fill (matches _hilite_row)
+# active-key fill; also every reverse-video row/field/word cursor
+KEY_HILITE = settings.color("HILITE", (230, 230, 230))
+
+HELP_DIM_C    = settings.color("HELP_DIM", (0, 0, 0, 200))   # veil behind help
+HELP_BORDER_C = settings.color("HELP_BORDER", (60, 120, 220))
+HELP_TITLE    = settings.sdl_color("HELP_TITLE", (120, 190, 255))
 
 
 class K:
@@ -737,6 +770,10 @@ class Screen:
 
     # ---- override per screen ----
     def on_enter(self):
+        pass
+
+    def on_leave(self):
+        """Called by the manager before another screen is shown."""
         pass
 
     def on_touch(self, x, y):
@@ -1560,7 +1597,7 @@ class ProgScreen(Screen):
 
     def _hilite_row(self, renderer, f, text, x, y, w, active):
         if active:
-            SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+            SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
             SDL_RenderFillRect(renderer, SDL_Rect(x - 4, y - 2, w, 56))
             draw_line(renderer, f, text, x, y, BLACK)
         else:
@@ -1637,7 +1674,7 @@ class ProgScreen(Screen):
         draw_line(renderer, f, "MODAL", 740, 140)
         for j in range(0, len(codes), 4):
             draw_line(renderer, f, " ".join(codes[j:j + 4]),
-                      740, 200 + (j // 4) * 50, SDL_Color(150, 150, 150))
+                      740, 200 + (j // 4) * 50, DIM)
 
     def _draw_mdi(self, renderer, f):
         draw_line(renderer, f, "MDI  (type block, EXEC or ENTER to run)", 10, 70)
@@ -1647,7 +1684,7 @@ class ProgScreen(Screen):
         if self.app.show_mdi_history:
             y = 200
             for cmd in list(self.mdi_hist)[:12]:
-                draw_line(renderer, f, cmd, 10, y, SDL_Color(150, 150, 150))
+                draw_line(renderer, f, cmd, 10, y, DIM)
                 y += 52
 
     def _draw_rstr(self, renderer, f):
@@ -1712,13 +1749,13 @@ class ProgScreen(Screen):
                 s, e = spans[self.edit_word]
                 x0 = 10 + text_width(f, prefix + line[:s])
                 wpx = text_width(f, line[s:e])
-                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+                SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
                 SDL_RenderFillRect(renderer,
                                    SDL_Rect(x0 - 3, y - 2, wpx + 6, 56))
                 draw_line(renderer, f, line[s:e], x0, y, BLACK)
             else:
                 # empty line: block cursor at the insert position
-                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255)
+                SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
                 SDL_RenderFillRect(renderer,
                                    SDL_Rect(10 + text_width(f, prefix),
                                             y - 2, 26, 56))
@@ -1809,9 +1846,8 @@ class OffsetScreen(Screen):
             ]))
             self._build_work_cursor()
         elif name == "TPROBE":
-            self.cursor = FieldCursor(cols=1)
-            self.cursor.add(0, 0, 200, 56,
-                setter=lambda t: self._pset_val("zero_height", t))
+            self.cursor = FieldCursor(cols=1)      # nothing to edit here
+            self._tsetter = self._read_toolsetter()
             self.set_root([
                 K("Z.PRB", lambda: self._confirm(self._tprobe_exec)),
                 K(), K(), K(), K(), K(), K(), K(),
@@ -2244,7 +2280,6 @@ class OffsetScreen(Screen):
         d = self.app.persist.setdefault("probe", {})
         for key, _lbl, dflt in PROBE_FIELDS:
             d.setdefault(key, dflt)
-        d.setdefault("zero_height", 0.0)
         return d
 
     def _pset_val(self, key, text):
@@ -2324,8 +2359,7 @@ class OffsetScreen(Screen):
     def _tprobe_exec(self):
         if not self._probe_ready():
             return
-        zh = self._pdefaults()["zero_height"]
-        self.app.mdi_async(f"o<{TOOL_SENSOR_MACRO}> call [{zh:g}]")
+        self.app.mdi_async(f"o<{TOOL_SENSOR_MACRO}> call")
         self._probe_pending = "TOOL"      # reload tool table when idle
 
     def _draw_pset(self, renderer, f):
@@ -2357,12 +2391,11 @@ class OffsetScreen(Screen):
                 fld.x, fld.y, fld.w, fld.h = x, y, self.CELL, self.CELL
                 cell = page.get((r, c))
                 if self.cursor.is_current(i):
-                    SDL_SetRenderDrawColor(renderer, 60, 60, 60, 255)
+                    SDL_SetRenderDrawColor(renderer, *CURSOR_C, 255)
                     SDL_RenderFillRect(renderer,
                                        SDL_Rect(x, y, self.CELL, self.CELL))
                 SDL_SetRenderDrawColor(renderer,
-                                       *((27, 95, 165) if cell else (45, 45, 45)),
-                                       255)
+                                       *(GRID_ON_C if cell else GRID_OFF_C), 255)
                 SDL_RenderDrawRect(renderer, SDL_Rect(x, y, self.CELL, self.CELL))
                 if cell:
                     draw_probe_icon(renderer, cell[1], r, c, x, y, self.CELL)
@@ -2382,10 +2415,10 @@ class OffsetScreen(Screen):
             labels = dict((k, l) for k, l, _x in PROBE_FIELDS)
             for n, key in enumerate(CAL_FIELDS.get(cell[0], ())):
                 draw_line(renderer, f, f"{labels[key]}: {d[key]:g}",
-                          730, 320 + n * 46, SDL_Color(150, 150, 150))
+                          730, 320 + n * 46, DIM)
         else:
             draw_line(renderer, f, "DIMS IN [P.SET]", 730, 320,
-                      SDL_Color(150, 150, 150))
+                      DIM)
         if getattr(self, "_probe_note", ""):
             draw_line(renderer, f, self._probe_note, 730, 510, RED)
         # The routine's own placement instructions, read from its .ngc. Full
@@ -2394,42 +2427,36 @@ class OffsetScreen(Screen):
             lines = macro_help(cell[0])
             for n, txt in enumerate(lines):
                 draw_line(renderer, f, txt, 40, 560 + n * 44,
-                          SDL_Color(150, 150, 150) if n == 0
-                          else SDL_Color(255, 150, 40))
+                          DIM if n == 0 else ACCENT)
+
+    TSETTER_KEYS = (("X", "SETTER X"), ("Y", "SETTER Y"),
+                    ("Z_REF", "Z REF"), ("Z_SAFE", "Z SAFE"))
+
+    def _read_toolsetter(self):
+        """[TOOLSETTER] values the macro runs from, read once on entry so the
+        draw loop does no file I/O. None for any key the INI lacks."""
+        try:
+            ini = linuxcnc.ini(self.app.stat.ini_filename)
+            return {k: ini.find("TOOLSETTER", k) for k, _l in self.TSETTER_KEYS}
+        except Exception:
+            return {k: None for k, _l in self.TSETTER_KEYS}
 
     def _draw_tprobe(self, renderer, f):
         draw_line(renderer, f, "TOOL LENGTH PROBE", 10, 70)
         st = self.app.stat
-        # --- BT taper (red) ---
-        SDL_SetRenderDrawColor(renderer, 250, 60, 60, 255)
-        SDL_RenderDrawLine(renderer, 150, 110, 150, 148)     # flange, left
-        SDL_RenderDrawLine(renderer, 250, 110, 250, 148)     # flange, right
-        SDL_RenderDrawLine(renderer, 150, 148, 178, 178)     # taper, left
-        SDL_RenderDrawLine(renderer, 250, 148, 222, 178)     # taper, right
-        SDL_RenderDrawLine(renderer, 178, 178, 222, 178)     # taper face
-        SDL_RenderDrawLine(renderer, 150, 110, 250, 110)     # flange top
-        # --- endmill body + flutes (blue) ---
-        SDL_SetRenderDrawColor(renderer, 133, 183, 235, 255)
-        SDL_RenderDrawRect(renderer, SDL_Rect(178, 178, 44, 130))
-        for i in range(4):
-            y0 = 190 + i * 32
-            SDL_RenderDrawLine(renderer, 178, y0 + 26, 222, y0)
-        # --- touch plate bracket (green) ---
-        SDL_SetRenderDrawColor(renderer, 60, 200, 90, 255)
-        SDL_RenderDrawLine(renderer, 140, 356, 260, 356)
-        SDL_RenderDrawLine(renderer, 140, 356, 140, 382)
-        SDL_RenderDrawLine(renderer, 260, 356, 260, 382)
-
         draw_line(renderer, f, f"TOOL IN SPINDLE: T{st.tool_in_spindle:02d}",
-                  420, 150)
-        draw_line(renderer, f, "Z ZERO HEIGHT", 420, 230)
-        fld = self.cursor.fields[0]
-        fld.x, fld.y, fld.w, fld.h = 800, 228, 200, 56
-        draw_field(renderer, f, f"{self._pdefaults()['zero_height']:g}",
-                   0, self.cursor)
-        draw_line(renderer, f,
-                  "SENSOR LOCATION FROM [TOOLSENSOR] INI  -  Z.PRB TO RUN",
-                  420, 320, SDL_Color(255, 150, 40))
+                  10, 150)
+        vals = getattr(self, "_tsetter", {})
+        for n, (key, label) in enumerate(self.TSETTER_KEYS):
+            v = vals.get(key)
+            draw_line(renderer, f, f"{label}: {v if v else 'NOT SET'}",
+                      10, 230 + n * 46, DIM if v else RED)
+        if st.tool_in_spindle <= 0:
+            draw_line(renderer, f, "NO TOOL LOADED", 10, 440, RED)
+        else:
+            draw_line(renderer, f,
+                      "Z.PRB MEASURES LOADED TOOL, WRITES LENGTH, APPLIES G43",
+                      10, 440, ACCENT)
 
     def _poll_probe(self, renderer, f):
         """Called each frame while a probe is running. Keeps the UI live,
@@ -2452,23 +2479,7 @@ class OffsetScreen(Screen):
             draw_line(renderer, f, "PROBING...", 730, 130, RED)
 
 
-class SystemScreen(Screen):
-    def on_enter(self):
-        self.set_root([K(), K(), K(), K(), K(), K(), K(), K(), K(),
-                       K("EXIT", self._exit_menu)])
-
-    def _exit_menu(self):
-        self.push([
-            K("CAN", self.pop),
-            K("EXEC", lambda: setattr(self.app, "quit", True)),
-        ])
-
-    def draw(self, renderer, area):
-        st = self.app.stat
-        f = self.app.font
-        draw_line(renderer, f, f"INI     {st.ini_filename}", 10, 80)
-        draw_line(renderer, f, f"JOINTS  {st.joints}", 10, 150)
-        draw_line(renderer, f, f"KINS    {st.kinematics_type}", 10, 220)
+# SystemScreen lives in systemscreen.py
 
 
 class MessageScreen(Screen):
@@ -2532,7 +2543,17 @@ class GraphicsScreen(Screen):
         bp = app.backplot
 
         if bp.needs_parse(app.stat):          # file changed while on screen
-            bp.load(app.stat)
+            bp.load(app.stat)                 # background; returns at once
+        bp.poll()                             # install a finished parse
+
+        if bp.loading:
+            n = bp.loading_count
+            msg = f"PLOT LOADING  ({n:,} segs)" if n else "PLOT LOADING"
+            plot_h = SOFTKEY_Y - STATUS_H - BUFFER_H
+            draw_line(renderer, app.font, msg,
+                      (1920 - PANE_W - text_width(app.font, msg)) // 2,
+                      STATUS_H + plot_h // 2 - 20)
+            return
 
         bp.update(app.stat)                   # advance gray-out
         bp.draw(0, STATUS_H, app.stat)        # plot + marker + UCS arrows
@@ -2547,7 +2568,7 @@ class GraphicsScreen(Screen):
                   1920 - PANE_W - 120, STATUS_H + 10)
         if bp.last_error:
             draw_line(renderer, app.font, bp.last_error, 10, STATUS_H + 10,
-                      SDL_Color(250, 0, 0))
+                      RED)
 
 
 # ---------------------------------------------------------------------------
@@ -2563,6 +2584,7 @@ class ScreenManager:
         self.active = None
         self.active_idx = None
         self.help_on = False
+        self.help_page = 0              # page of a multi-page help entry
         self.pressed_key = None         # softkey slot held by finger/mouse
         try:
             with open(os.path.join(os.path.dirname(__file__), "help.json")) as fp:
@@ -2572,6 +2594,8 @@ class ScreenManager:
 
     def show(self, idx):
         if idx in self.screens:
+            if self.active is not None and self.active is not self.screens[idx]:
+                self.active.on_leave()
             self.active = self.screens[idx]
             self.active_idx = idx
             variant = PANE_SCREENS.get(idx)
@@ -2581,8 +2605,8 @@ class ScreenManager:
             self.active.on_enter()
 
     def on_softkey(self, i):
-        if self.help_on:                 # any softkey dismisses help
-            self.help_on = False
+        if self.help_on:
+            self._help_key(i)
             return
         self.active.on_softkey(i)
 
@@ -2601,8 +2625,8 @@ class ScreenManager:
         return min(11, (x - KEY_X0) // KEY_W + 1)
 
     def on_press(self, x, y):
-        if self.help_on:                 # a tap anywhere dismisses help
-            self.help_on = False
+        if self.help_on:                 # [<]/[>] page, a tap elsewhere closes
+            self._help_key(self.softkey_at(x, y))
             return
         self.pressed_key = self.softkey_at(x, y)
         if self.pressed_key is None and self.active:
@@ -2620,6 +2644,32 @@ class ScreenManager:
 
     def toggle_help(self):
         self.help_on = not self.help_on
+        self.help_page = 0
+
+    HELP_LINES = 16                     # body lines per help page
+
+    def _help_pages(self, entry):
+        """An entry's body as pages. `_body` is either a list of lines (cut
+        into HELP_LINES pages here) or a list of pages, each a list of lines,
+        for entries split by hand at sensible breaks."""
+        body = entry.get("_body", [])
+        if body and isinstance(body[0], list):
+            pages = [p[:self.HELP_LINES] for p in body]
+        else:
+            pages = [body[k:k + self.HELP_LINES]
+                     for k in range(0, len(body), self.HELP_LINES)]
+        return pages or [[]]
+
+    def _help_key(self, i):
+        """While help is up: [>] next page, [<] previous page, any other
+        softkey (or [>] on the last page) closes it."""
+        n = len(self._help_pages(self._help_entry()))
+        if i == 11 and self.help_page < n - 1:
+            self.help_page += 1
+        elif i == 0 and self.help_page > 0:
+            self.help_page -= 1
+        else:
+            self.help_on = False
 
     def _help_entry(self):
         """Map the active screen (+ its chapter, if any) to a help entry."""
@@ -2677,7 +2727,7 @@ class ScreenManager:
                 x0 + 2, SOFTKEY_Y + 2, self.W - x0 - 4, kh))
 
         # --- softkey frame ---
-        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255)
+        SDL_SetRenderDrawColor(renderer, *FRAME_C, 255)
         SDL_RenderDrawLine(renderer, 0, SOFTKEY_Y, self.W, SOFTKEY_Y)
         for i in range(12):
             SDL_RenderDrawLine(renderer, KEY_X0 + KEY_W * i, SOFTKEY_Y,
@@ -2713,27 +2763,41 @@ class ScreenManager:
         f = self.app.font
         # dim the screen, then a bordered panel
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND)
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200)
+        SDL_SetRenderDrawColor(renderer, *HELP_DIM_C)
         SDL_RenderFillRect(renderer, SDL_Rect(0, 0, self.W, self.H))
-        px, py = 120, 120
-        pw, ph = self.W - 240, self.H - 240
-        SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255)
+        px, py = 120, 90
+        pw, ph = self.W - 240, self.H - 180
+        SDL_SetRenderDrawColor(renderer, *BG_C, 255)
         SDL_RenderFillRect(renderer, SDL_Rect(px, py, pw, ph))
-        SDL_SetRenderDrawColor(renderer, 60, 120, 220, 255)
+        SDL_SetRenderDrawColor(renderer, *HELP_BORDER_C, 255)
         SDL_RenderDrawRect(renderer, SDL_Rect(px, py, pw, ph))
 
-        draw_line(renderer, f, "HELP - " + entry.get("_title", ""),
-                  px + 30, py + 24, SDL_Color(120, 190, 255))
+        pages = self._help_pages(entry)
+        self.help_page = min(self.help_page, len(pages) - 1)
+        n = len(pages)
+        title = "HELP - " + entry.get("_title", "")
+        if n > 1:
+            title += f"  ({self.help_page + 1}/{n})"
+        draw_line(renderer, f, title, px + 30, py + 24, HELP_TITLE)
         y = py + 90
-        for line in entry.get("_body", []):
+        for line in pages[self.help_page]:
             draw_line(renderer, f, line, px + 30, y)
             y += 44
-        draw_line(renderer, f, "PRESS ANY SOFTKEY TO CLOSE",
-                  px + 30, py + ph - 54, SDL_Color(255, 150, 40))
+        if n == 1:
+            foot = "PRESS ANY SOFTKEY TO CLOSE"
+        elif self.help_page < n - 1:
+            foot = "[>] NEXT PAGE" + ("   [<] BACK" if self.help_page else "") \
+                   + "   OTHER SOFTKEYS CLOSE"
+        else:
+            foot = "[<] BACK   ANY OTHER SOFTKEY CLOSES"
+        draw_line(renderer, f, foot, px + 30, py + ph - 54, ACCENT)
 
     def _input_line(self, renderer):
         y = SOFTKEY_Y - BUFFER_H
         txt = self.app.input.text
         if (SDL_GetTicks() // 500) % 2:          # blinking entry cursor
             txt += "_"
+        # a long raw line (SYSTEM editor) shows its tail, not its head
+        while len(txt) > 1 and text_width(self.app.font, txt) > self.W - 20:
+            txt = txt[1:]
         draw_line(renderer, self.app.font, txt, 10, y)

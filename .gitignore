@@ -3,3 +3,4 @@ __pycache__/
 machine_counters.json
 tool_wear.json
 *.var.bak
+tests

@@ -6,6 +6,7 @@ import subprocess
 import time
 import linuxcnc
 from sdl2 import *
+import settings
 from screens import draw_line, AXIS_IDX, PANE_W
 
 try:
@@ -14,9 +15,13 @@ try:
 except ImportError:
     _HAL_OK = False
 
-GREEN  = SDL_Color(40, 200, 120)
-ORANGE = SDL_Color(255, 150, 40)
-DIM    = SDL_Color(150, 150, 150)
+GREEN     = settings.sdl_color("OK", (40, 200, 120))
+ORANGE    = settings.sdl_color("ACCENT", (255, 150, 40))
+DIM       = settings.sdl_color("DIM", (150, 150, 150))
+FRAME     = settings.color("FRAME", (0, 0, 255))
+LOAD_RAIL = settings.color("LOAD_RAIL", (130, 60, 60))
+LOAD_OK   = settings.color("LOAD_OK", (40, 200, 120))
+LOAD_OVER = settings.color("LOAD_OVER", (220, 60, 60))
 
 # HAL pins for load bars; wire these when the EtherCAT torque PDOs exist.
 LOAD_PINS = {
@@ -55,6 +60,7 @@ class StatusPane:
         # cycle timing state
         self.cycle_start = None
         self.cycle_accum = 0.0     # survives pauses
+        self.last_cycle = app.persist.get("last_cycle_seconds", 0.0)
         self.run_mark = time.monotonic()
         self._was_running = False
 
@@ -92,6 +98,7 @@ class StatusPane:
     def _save(self):
         self.app.persist["parts"] = self.parts
         self.app.persist["run_seconds"] = self.run_total
+        self.app.persist["last_cycle_seconds"] = self.last_cycle
         self.app.save_persist()
 
     def reset_parts(self):
@@ -126,6 +133,7 @@ class StatusPane:
             if self.cycle_start is not None:
                 self.cycle_accum += now - self.cycle_start
                 self.cycle_start = None
+            self.last_cycle = self.cycle_accum          # hold for the next run
             self.parts += 1                             # M2/M30 completion
             self._save()
         self._was_running = running
@@ -170,7 +178,7 @@ class StatusPane:
         """variant: 'LOADS' or 'POSMODE'."""
         app, st, f = self.app, self.app.stat, self.app.font
         # frame
-        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255)
+        SDL_SetRenderDrawColor(renderer, *FRAME, 255)
         SDL_RenderDrawLine(renderer, x0, y0, x0, y0 + h)
         SDL_RenderDrawLine(renderer, x0, y0, x0 + w, y0)
 
@@ -178,6 +186,8 @@ class StatusPane:
         y = y0 + 8
 
         draw_line(renderer, f, f"CYCLE {_fmt_hms(self.cycle_seconds())}", x, y)
+        y += self.ROW
+        draw_line(renderer, f, f"LAST  {_fmt_hms(self.last_cycle)}", x, y, DIM)
         y += self.ROW
         draw_line(renderer, f, f"RUN   {_fmt_hms(self.run_total)}", x, y)
         y += self.ROW
@@ -225,7 +235,7 @@ class StatusPane:
         for axis in tuple(self.app.axes) + ("S",):
             draw_line(renderer, f, axis, x, y - 6)
             # rail + 100% tick + end tick
-            SDL_SetRenderDrawColor(renderer, 130, 60, 60, 255)
+            SDL_SetRenderDrawColor(renderer, *LOAD_RAIL, 255)
             SDL_RenderDrawLine(renderer, bar_x, y + self.BAR_H // 2,
                                bar_x + bar_w, y + self.BAR_H // 2)
             for tx in (bar_x + bar_w // 2, bar_x + bar_w):
@@ -235,8 +245,7 @@ class StatusPane:
                 fill = int(min(val, 200.0) / 200.0 * bar_w)
                 over = val > 100.0
                 SDL_SetRenderDrawColor(renderer,
-                                       *(220, 60, 60) if over else (40, 200, 120),
-                                       255)
+                                       *(LOAD_OVER if over else LOAD_OK), 255)
                 SDL_RenderFillRect(renderer,
                                    SDL_Rect(bar_x, y, fill, self.BAR_H))
             y += self.ROW

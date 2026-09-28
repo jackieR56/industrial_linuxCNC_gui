@@ -7,26 +7,36 @@
 
 import os
 import math
+import queue
 import shutil
 import tempfile
+import threading
+import types
 
 import linuxcnc
 import gcode
 
 from sdl2 import *
 
+import settings
+
 # ---------------------------------------------------------------------------
 # Colors
 # ---------------------------------------------------------------------------
-TOOL_PALETTE = [                      # indexed by tool % len — feed moves
+TOOL_PALETTE = settings.get_palette(  # indexed by tool % len — feed moves
+    "GUI_COLORS", "BP_TOOL_PALETTE", [
     (255, 255, 255), (255, 210,  60), ( 80, 220, 100), (100, 170, 255),
     (255, 120, 120), (220, 120, 255), ( 90, 230, 230), (255, 160,  40),
-]
-RAPID_COLOR   = ( 70,  70, 130)       # traverses, always this (dim blue)
-GRAY_FEED     = ( 85,  85,  85)       # executed feed
-GRAY_RAPID    = ( 40,  40,  60)       # executed rapid
-MARKER_COLOR  = (255, 255,   0)
-AXIS_COLORS   = {"X": (255, 60, 60), "Y": (60, 220, 60), "Z": (80, 120, 255)}
+])
+RAPID_COLOR   = settings.color("BP_RAPID", (70, 70, 130))     # traverses (dim blue)
+GRAY_FEED     = settings.color("BP_GRAY_FEED", (85, 85, 85))  # executed feed
+GRAY_RAPID    = settings.color("BP_GRAY_RAPID", (40, 40, 60)) # executed rapid
+MARKER_COLOR  = settings.color("BP_MARKER", (255, 255, 0))
+TOOL_VECTOR   = settings.color("BP_TOOL_VECTOR", (255, 160, 40))
+BG_COLOR      = settings.color("BACKGROUND", (0, 0, 0))
+AXIS_COLORS   = {"X": settings.color("BP_AXIS_X", (255, 60, 60)),
+                 "Y": settings.color("BP_AXIS_Y", (60, 220, 60)),
+                 "Z": settings.color("BP_AXIS_Z", (80, 120, 255))}
 
 # ---------------------------------------------------------------------------
 # Views: (name -> 3x2 projection). u,v are math coords, v-up; pixel flip
@@ -48,9 +58,10 @@ VIEWS = {
 class PlotCanon:
     ARC_CHORD_DEG = 4.0                # tessellation step; ~90 segs per circle
 
-    def __init__(self, stat, parameter_file):
-        self.stat = stat
+    def __init__(self, stat, parameter_file, cancelled=lambda: False):
+        self.stat = stat                        # a snapshot, never live stat
         self.parameter_file = parameter_file    # read by the gcode module
+        self.cancelled = cancelled              # -> True aborts the parse
         # gcode.parse emits positions in INCHES ("internal units") regardless
         # of machine units — verified empirically (identical inch-sized
         # extents on mm and inch configs; no units callback consulted).
@@ -73,7 +84,7 @@ class PlotCanon:
         return lambda *a, **k: None
 
     # ---- callbacks that must return real values ----
-    def check_abort(self):                return False
+    def check_abort(self):                return self.cancelled()
     def get_block_delete(self):           return False
     def get_axis_mask(self):              return self.stat.axis_mask
     def get_external_angular_units(self): return self.stat.angular_units or 1.0
@@ -217,14 +228,76 @@ class Backplot2D:
         self._last_line = 0
         self.last_error = None
         self._parsed_file = None
+        # background parse state. SDL work (fit/rebake) stays on the main
+        # thread; the worker only builds the segment list.
+        self.loading = False
+        self._loading_file = None
+        self._gen = 0             # bumped per load/invalidate; stale -> abort
+        self._thread = None
+        self._results = queue.Queue()
+        self._canon = None        # in-flight canon, for loading_count
 
     # ------------------------------------------------------------------ parse
+    SNAP_FIELDS = ("file", "ini_filename", "linear_units", "angular_units",
+                   "axis_mask", "tool_table", "g5x_offset", "g92_offset",
+                   "rotation_xy", "program_units")
+
     def load(self, stat):
-        """Parse stat.file into the segment list. Call on file change."""
+        """Start parsing stat.file in the background. Call on file change;
+        poll() picks up the result."""
         path = stat.file
         if not path:
             return
-        self.last_error = None
+        # the main loop keeps polling live stat, so the worker gets a copy
+        snap = types.SimpleNamespace(
+            **{f: getattr(stat, f) for f in self.SNAP_FIELDS})
+        self._gen += 1
+        if self._thread is not None:
+            # gcode.parse is not reentrant; the bumped gen makes the old
+            # parse abort at its next check_abort, so this is short
+            self._thread.join()
+        self.loading = True
+        self._loading_file = path
+        self._thread = threading.Thread(target=self._parse_worker,
+                                        args=(snap, self._gen), daemon=True)
+        self._thread.start()
+
+    def invalidate(self):
+        """Force a re-parse (program reloaded); cancels any in-flight parse."""
+        self._gen += 1
+        self._parsed_file = None
+        self._loading_file = None
+        self.loading = False
+
+    @property
+    def loading_count(self):
+        """Segments collected so far by the in-flight parse."""
+        c = self._canon
+        return len(c.segments) if c is not None else 0
+
+    def poll(self):
+        """Main thread, once per frame: install a finished parse."""
+        while True:
+            try:
+                gen, path, segments, error = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if gen != self._gen:
+                continue                       # superseded — drop it
+            self.segments = segments
+            self.last_error = error
+            self._parsed_file = path
+            self._loading_file = None
+            self.loading = False
+            self._progress = 0
+            self._last_line = 0
+            self.fit()
+            self.rebake()
+
+    def _parse_worker(self, stat, gen):
+        """Worker thread: gcode.parse into a segment list. No SDL here."""
+        path = stat.file
+        error = None
 
         # scratch copy of the parameter file so parse can't clobber live params
         ini = linuxcnc.ini(stat.ini_filename)
@@ -237,7 +310,9 @@ class Backplot2D:
         except OSError:
             pass
 
-        canon = PlotCanon(stat, tmp_var.name)
+        canon = PlotCanon(stat, tmp_var.name,
+                          cancelled=lambda: gen != self._gen)
+        self._canon = canon
         # The preview interpreter reads INI_FILE_NAME from the environment.
         # Axis inherits it from the linuxcnc launcher; a GUI started from its
         # own terminal does not have it — set it explicitly.
@@ -259,27 +334,19 @@ class Backplot2D:
         try:
             result, seq = gcode.parse(path, canon, unitcode, initcode)
             if result > gcode.MIN_ERROR:
-                self.last_error = gcode.strerror(result)
+                error = gcode.strerror(result)
         except Exception as e:
-            self.last_error = str(e)
+            error = str(e)
         finally:
             os.unlink(tmp_var.name)
+            if self._canon is canon:
+                self._canon = None
 
-        self.segments = canon.segments
-        if self.segments:
-            xs = [v for s in self.segments for v in (s[0], s[3])]
-            ys = [v for s in self.segments for v in (s[1], s[4])]
-            zs = [v for s in self.segments for v in (s[2], s[5])]
-            # print(f"backplot extents: {len(self.segments)} segs  "
-            #       f"X {min(xs):.3f}..{max(xs):.3f}  "
-            #       f"Y {min(ys):.3f}..{max(ys):.3f}  "
-            #       f"Z {min(zs):.3f}..{max(zs):.3f}")
-        self._parsed_file = path
-        self.fit()
-        self.rebake()
+        self._results.put((gen, path, canon.segments, error))
 
     def needs_parse(self, stat):
-        return stat.file and stat.file != self._parsed_file
+        return (stat.file and stat.file != self._parsed_file
+                and stat.file != self._loading_file)
 
     # ------------------------------------------------------------------ views
     def _project(self, x, y, z):
@@ -343,7 +410,7 @@ class Backplot2D:
         """Full redraw of the static plot into the texture.
         Segments up to _progress stay gray (survives view/zoom changes)."""
         SDL_SetRenderTarget(self.renderer, self.tex)
-        SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 255)
+        SDL_SetRenderDrawColor(self.renderer, *BG_COLOR, 255)
         SDL_RenderClear(self.renderer)
         for i, seg in enumerate(self.segments):
             self._draw_seg(seg, executed=(i < self._progress))
@@ -428,7 +495,7 @@ class Backplot2D:
             u, vv = self._project(*v)      # direction only — no pan/scale
             L = 70                         # px at full length
             ex, ey = mx + int(u * L), my - int(vv * L)
-            SDL_SetRenderDrawColor(self.renderer, 255, 160, 40, 255)
+            SDL_SetRenderDrawColor(self.renderer, *TOOL_VECTOR, 255)
             SDL_RenderDrawLine(self.renderer, mx, my, ex, ey)
             if u * u + vv * vv < 0.01:
                 # axis points at the viewer: small square instead of a dot

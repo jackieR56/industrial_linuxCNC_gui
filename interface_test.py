@@ -13,22 +13,33 @@ from datetime import datetime
 from statuspane import StatusPane
 
 import linuxcnc
+import settings
 
-from screens import (render_text, blit_text, draw_line, InputBuffer, FieldCursor,
+from screens import (render_text, blit_text, draw_line, text_width,
+                     InputBuffer, FieldCursor,
                      PosScreen, ProgScreen, OffsetScreen,
-                     SystemScreen, MessageScreen, GraphicsScreen,
+                     MessageScreen, GraphicsScreen,
                      ScreenManager, WCS, AXIS_IDX, PANE_W)
+from systemscreen import SystemScreen
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 WIN_W, WIN_H = 1920, 1080
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/ISOCPEUR.TTF"
-FONT_SIZE = 48
-LARGE_FONT_SIZE = 180
+FONT_PATH = settings.get_path("GUI", "FONT_PATH",
+                              "/usr/share/fonts/truetype/dejavu/ISOCPEUR.TTF")
+FONT_SIZE = settings.get_int("GUI", "FONT_SIZE", 48)
+LARGE_FONT_SIZE = settings.get_int("GUI", "LARGE_FONT_SIZE", 180)
+
+BACKGROUND = settings.color("BACKGROUND", (0, 0, 0))
+EMG_ON     = settings.color("EMG_ON", (200, 0, 0))     # blink, bright phase
+EMG_DIM    = settings.color("EMG_DIM", (80, 0, 0))     # blink, dim phase
+ALARM      = settings.sdl_color("ALARM", (250, 0, 0))
 # JOG_VEL = 30.0 / 60.0
 
 MODES = ("None", "MANU", "AUTO", "MDI")
+
+CAN_HOLD_MS = 1000     # hold CAN this long to wipe the whole input buffer
 
 # persistent counters/settings (parts, run hours, display units).
 # NOTE for the read-only-rootfs deployment: point this at the writable
@@ -45,13 +56,18 @@ GRAPHICS = 5
 
 # page-select keys — remap freely
 PAGE_KEYS = {
-    SDL_SCANCODE_F13:    POSITION,
-    SDL_SCANCODE_F14: PROG,
-    SDL_SCANCODE_F15:    OFFSET,
-    SDL_SCANCODE_F17:       SYSTEM,
-    SDL_SCANCODE_F18:      MESSAGE,
-    SDL_SCANCODE_F19:    GRAPHICS,
+    SDL_SCANCODE_PAGEUP:    POSITION,
+    SDL_SCANCODE_RSHIFT: PROG,
+    SDL_SCANCODE_PAGEDOWN:    OFFSET,
+    SDL_SCANCODE_LSHIFT:       SYSTEM,
+    SDL_SCANCODE_CAPSLOCK:      MESSAGE,
+    SDL_SCANCODE_TAB:    GRAPHICS,
 }
+
+# page keys that double as keyboard modifiers; ignored while the input
+# buffer is in raw mode (SYSTEM editor pages)
+RAW_MODIFIER_KEYS = {SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RSHIFT,
+                     SDL_SCANCODE_CAPSLOCK}
 
 # softkeys: F1 = [<], F2..F11 = keys 1-10, F12 = [>]
 SOFTKEYS = {
@@ -65,14 +81,6 @@ SOFTKEYS = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _parse_ini_arg(argv):
-    """LinuxCNC launches DISPLAY programs as: prog -ini /path/to/file.ini"""
-    it = iter(argv[1:])
-    for a in it:
-        if a in ("-ini", "--ini"):
-            return next(it, None)
-    return None
 
 def program_number(path):
     try:
@@ -89,14 +97,11 @@ def program_number(path):
 def draw_status_box(renderer, font, x, y, w, h, text, active):
     if active:
         blink = (SDL_GetTicks() // 500) % 2          # flips every 500 ms
-        if blink:
-            SDL_SetRenderDrawColor(renderer, 200, 0, 0, 255)   # bright phase
-        else:
-            SDL_SetRenderDrawColor(renderer, 80, 0, 0, 255)    # dim phase
+        SDL_SetRenderDrawColor(renderer, *(EMG_ON if blink else EMG_DIM), 255)
         SDL_RenderFillRect(renderer, SDL_Rect(x, y, w, h))
         draw_line(renderer, font, text, x + 8, y + 6)
     else:
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
+        SDL_SetRenderDrawColor(renderer, *BACKGROUND, 255)
         SDL_RenderFillRect(renderer, SDL_Rect(x, y, w, h))
 
 
@@ -199,10 +204,12 @@ class App:
         self.command = linuxcnc.command()
         self.input = InputBuffer()
         self.alarms = AlarmSystem()
-        self.always_show_position = True    # True for the stepper machine
+        # True for the stepper machine
+        self.always_show_position = settings.get_bool(
+            "GUI", "ALWAYS_SHOW_POSITION", True)
         self.pane = None
         self.quit = False                   # set by SYSTEM -> EXIT -> EXEC                    # set after renderer exists
-        self.axes = "XYZAC"                 # "XYZ" for the 3-axis machine
+        self.axes = settings.get_str("GUI", "AXES", "XYZAC")   # "XYZ" for 3-axis
         self.rel_origin = [0.0] * 9         # machine units, 9-tuple indexed
 
         # persistent settings/counters
@@ -215,9 +222,11 @@ class App:
         self._pending_program = self.persist.get("last_program")
 
         # --- PROG page flags ---
-        self.show_mdi_history = True   # True: keep executed MDI blocks listed
+        # True: keep executed MDI blocks listed
+        self.show_mdi_history = settings.get_bool("GUI", "SHOW_MDI_HISTORY", True)
         # auto-mounted panel USB ports (udev rule -> fixed paths):
-        self.usb_mounts = ["/media/usb0", "/media/usb1"]
+        self.usb_mounts = settings.get_list("GUI", "USB_MOUNTS",
+                                            ["/media/usb0", "/media/usb1"])
         # machine program directory from the ini
         self.stat.poll()
         try:
@@ -283,7 +292,7 @@ class App:
         self.command.wait_complete()
         self.ndisp.invalidate()
         if hasattr(self, "backplot"):
-            self.backplot._parsed_file = None
+            self.backplot.invalidate()
         self.persist["last_program"] = path      # <-- remember it
         self.save_persist()
 
@@ -378,6 +387,7 @@ def main():
     event = SDL_Event()
     running = True
     finger = None                   # id of the one finger we track at a time
+    can_down = None                 # SDL_GetTicks() when CAN went down, else None
 
     if app._pending_program and os.path.exists(app._pending_program):
         try:
@@ -403,8 +413,10 @@ def main():
                 if sc == SDL_SCANCODE_ESCAPE:        # RESET key
                     app.reset()
                     mgr.screens[PROG].view_line = 0  # rewind PRGRM display
-                elif sc == SDL_SCANCODE_BACKSPACE and app.input.text:
-                    app.input.backspace()
+                elif sc == SDL_SCANCODE_BACKSPACE:   # CAN
+                    can_down = SDL_GetTicks()
+                    if app.input.text:
+                        app.input.backspace()
                 elif sc == SDL_SCANCODE_LALT:
                     mgr.on_edit_key("ALTER")
                 elif sc == SDL_SCANCODE_INSERT:
@@ -414,11 +426,24 @@ def main():
                 elif sc == SDL_SCANCODE_LCTRL:
                     mgr.toggle_help()
                 elif sc in PAGE_KEYS:
-                    mgr.show(PAGE_KEYS[sc])
+                    # The SYSTEM editor pages take raw text from an external
+                    # keyboard, where Shift and Caps Lock are modifiers, not
+                    # page keys.
+                    if not (app.input.raw and sc in RAW_MODIFIER_KEYS):
+                        mgr.show(PAGE_KEYS[sc])
                 elif sc in SOFTKEYS:
                     mgr.on_softkey(SOFTKEYS[sc])
                 else:
                     mgr.on_key(sc)
+
+            elif event.type == SDL_KEYUP:
+                if event.key.keysym.scancode == SDL_SCANCODE_BACKSPACE:
+                    can_down = None
+
+            # a lost focus can swallow the KEYUP — disarm the hold ourselves
+            elif event.type == SDL_WINDOWEVENT:
+                if event.window.event == SDL_WINDOWEVENT_FOCUS_LOST:
+                    can_down = None
 
             # --- touch / pointer ------------------------------------------
             # Both families are handled: SDL synthesises mouse events from
@@ -453,8 +478,13 @@ def main():
                 mgr.on_release(int(event.tfinger.x * mgr.W),
                                int(event.tfinger.y * mgr.H))
 
+        # CAN held past the threshold: wipe the buffer, once per press
+        if can_down is not None and SDL_GetTicks() - can_down >= CAN_HOLD_MS:
+            app.input.clear()
+            can_down = None
+
         # --- draw -----------------------------------------------------------
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
+        SDL_SetRenderDrawColor(renderer, *BACKGROUND, 255)
         SDL_RenderClear(renderer)
 
         # active screen content + softkey frame/labels + pane
@@ -473,10 +503,19 @@ def main():
 
         draw_status_box(renderer, font, 990, 6, 120, 50, "EMG", app.stat.estop)
 
+        # machine clock, right-aligned in the top band
+        clock = datetime.now().strftime("%H:%M:%S")
+        clock_x = WIN_W - 10 - text_width(font, clock)
+        draw_line(renderer, font, clock, clock_x, 10)
+
+        # alarm text is unbounded, so trim it to stop short of the clock
         latest = app.alarms.latest()
         if latest is not None:
-            draw_line(renderer, font, latest["text"], 1110, 10,
-                      SDL_Color(250, 0, 0))
+            text = latest["text"]
+            avail = clock_x - 20 - 1110
+            while text and text_width(font, text) > avail:
+                text = text[:-1]
+            draw_line(renderer, font, text, 1110, 10, ALARM)
 
         SDL_RenderPresent(renderer)
         SDL_Delay(16)   # ~60 Hz
@@ -490,9 +529,8 @@ def main():
     TTF_Quit()
     SDL_Quit()
 
-INI_PATH = _parse_ini_arg(sys.argv)
-if INI_PATH:
-    os.environ.setdefault("INI_FILE_NAME", INI_PATH)
+if settings.INI_PATH:
+    os.environ.setdefault("INI_FILE_NAME", settings.INI_PATH)
 
 if __name__ == "__main__":
     main()

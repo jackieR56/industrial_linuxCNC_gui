@@ -205,26 +205,30 @@
   "OFFSET_PROBE": {
     "_title": "PROBE - WORK",
     "_body": [
-      "Use these pages to set a work offset.",
-      "",
-      "  OUT   - outside edges and corners",
-      "  IN    - inside surfaces and corners",
-      "  ANGLE - the angle of an edge",
-      "  BOSS  - the center of a boss or a pocket",
-      "  RIDGE - the center of a ridge or a valley",
-      "  CAL   - calibrate the stylus on a gauge",
-      "",
-      "In the 3x3 grid, green is the workpiece, red is",
-      "the start position, purple is the movement.",
-      "The center cell is a Z touch.",
-      "Use the arrow keys to select a cell.",
-      "The text under the grid is read from the probe",
-      "routine itself. It says where to put the probe.",
-      "P.SET has the clearances and the feeds.",
-      "The control writes to the active system.",
-      "",
-      "WARNING: make sure that the path is clear.",
-      "Move the probe to the start. Then push EXEC."
+      [
+        "Use these pages to set a work offset.",
+        "",
+        "  OUT   - outside edges and corners",
+        "  IN    - inside surfaces and corners",
+        "  ANGLE - the angle of an edge",
+        "  BOSS  - the center of a boss or a pocket",
+        "  RIDGE - the center of a ridge or a valley",
+        "  CAL   - calibrate the stylus on a gauge",
+        "",
+        "In the 3x3 grid, green is the workpiece, red is",
+        "the start position, purple is the movement.",
+        "The center cell is a Z touch.",
+        "Use the arrow keys to select a cell."
+      ],
+      [
+        "The text under the grid is read from the probe",
+        "routine itself. It says where to put the probe.",
+        "P.SET has the clearances and the feeds.",
+        "The control writes to the active system.",
+        "",
+        "WARNING: make sure that the path is clear.",
+        "Move the probe to the start. Then push EXEC."
+      ]
     ]
   },
   "OFFSET_PSET": {
@@ -242,10 +246,134 @@
   "SYSTEM": {
     "_title": "SYSTEM",
     "_body": [
-      "This page shows the machine configuration:",
-      "the ini file, the number of joints, and the",
-      "type of kinematics.",
+      "Use this page to look after the machine",
+      "configuration files (ini and hal).",
       "",
+      "  DIR    - the configuration directory",
+      "  USB    - the USB drive, for backups",
+      "  TEXT   - edit the selected file as lines",
+      "  FIELDS - edit the selected file as values",
+      "  INFO   - paths, joints, and the launcher",
+      "",
+      "Select a file in DIR. TEXT and FIELDS both edit",
+      "that file. SAVE writes <file>.bak first.",
+      "The control must be restarted for a change to",
+      "take effect: (OPRT) RESTRT.",
+      "EXIT stops the control (CAN / EXEC)."
+    ]
+  },
+  "SYSTEM_DIR": {
+    "_title": "SYSTEM - DIRECTORY",
+    "_body": [
+      "This page shows the configuration directory.",
+      "The selected file is orange with a > mark.",
+      "RETURN or SELECT opens a folder or selects",
+      "a file and goes to FIELDS (or TEXT).",
+      "",
+      "(OPRT):",
+      "  SELECT - select the file or open the folder",
+      "  COPY   - copy the file to the USB drive",
+      "  RESTOR - put back the .bak copy (CAN / EXEC)",
+      "  REFRSH - read the directory again"
+    ]
+  },
+  "SYSTEM_USB": {
+    "_title": "SYSTEM - USB",
+    "_body": [
+      "This page shows the USB drive.",
+      "",
+      "(OPRT):",
+      "  SELECT - select the file or open the folder",
+      "  COPY   - copy the file to the configuration",
+      "           directory (CAN / EXEC). The old file",
+      "           is kept as .bak.",
+      "  REFRSH - read the drive again"
+    ]
+  },
+  "SYSTEM_TEXT": {
+    "_title": "SYSTEM - TEXT",
+    "_body": [
+      [
+        "Use this page to edit the file as lines.",
+        "",
+        "USE AN EXTERNAL KEYBOARD: this page keeps",
+        "small letters, and Shift and Caps Lock do not",
+        "change the page here.",
+        "",
+        "You cannot edit during a program.",
+        "Up and Down move the line cursor.",
+        "Left and Right move the word cursor.",
+        "RETURN adds the typed text as a new line.",
+        "The INSERT, ALTER, and DELETE keys act on",
+        "the selected word.",
+        "",
+        "A * after the file name shows unsaved changes.",
+        "Push [>] for the (OPRT) keys."
+      ],
+      [
+        "(OPRT):",
+        "  INSERT  - add the typed words after the word",
+        "  ALTER   - replace the selected word",
+        "  DEL.WRD - delete the selected word",
+        "  ALT.LIN - replace the full line",
+        "  DEL.LIN - delete the full line",
+        "  SRH v ^ - find the typed text",
+        "  SAVE    - write the file, old copy to .bak",
+        "  CANCEL  - discard the changes",
+        "",
+        "(OPRT) page 2:",
+        "  RESTOR  - put back the .bak copy",
+        "  RESTRT  - save and restart the control"
+      ]
+    ]
+  },
+  "SYSTEM_FIELDS": {
+    "_title": "SYSTEM - FIELDS",
+    "_body": [
+      [
+        "Use this page to edit the file as values.",
+        "USE AN EXTERNAL KEYBOARD (see TEXT).",
+        "Type a value, then push INPUT or RETURN.",
+        "The orange line shows the full value.",
+        "Gray cells are read-only: use TEXT for them.",
+        "",
+        "ini file: one field for each KEY = value.",
+        "  SEC v ^    - next / previous section",
+        "  DELETE key - make the value empty",
+        "",
+        "  SRH v ^ - find the typed text",
+        "  SAVE    - write the file, old copy to .bak",
+        "  CANCEL  - discard the changes",
+        "  RESTOR / RESTRT - (OPRT) page 2, as TEXT",
+        "",
+        "Push [>] for the hal file fields."
+      ],
+      [
+        "hal file: two fields for each command.",
+        "  net    - the SIGNAL, then the PINS",
+        "  setp   - the PIN, then the VALUE",
+        "  loadrt - the COMP, then the ARGS",
+        "  addf   - the FUNC, then the THREAD",
+        "",
+        "  APPLY - send the setp on this line to the",
+        "          running hal now (CAN / EXEC).",
+        "          This does not save the file.",
+        "  PINS  - show the live values of the pins",
+        "          on the selected line.",
+        "",
+        "The other keys are the same as for an ini file."
+      ]
+    ]
+  },
+  "SYSTEM_INFO": {
+    "_title": "SYSTEM - INFO",
+    "_body": [
+      "This page shows the ini file, the configuration",
+      "directory, the joints and the kinematics, the",
+      "selected file and its .bak copy, and whether",
+      "the restart launcher (run_gui.sh) is in use.",
+      "",
+      "(OPRT) RESTRT - save and restart the control.",
       "EXIT stops the control (CAN / EXEC)."
     ]
   },
@@ -273,6 +401,118 @@
       "Softkeys: the XY, XZ, YZ, and ISO views, ZOOM,",
       "the arrows to move the view, FIT, and REDRAW.",
       "REDRAW erases the gray trace."
+    ]
+  },
+  "SYSTEM_PHYS": {
+    "_title": "SYSTEM - PHYS",
+    "_body": [
+      [
+        "Live state of the field devices: EtherCAT",
+        "terminals and drives, Modbus / RS485 devices,",
+        "other hardware drivers. One row on the left for",
+        "each device; its lamp is green when its status",
+        "pins (slave online + operational) are all TRUE,",
+        "red when not, gray when it has none.",
+        "Read-only: nothing here changes HAL.",
+        "",
+        "  Arrows    - move the cursor (down the column,",
+        "              off the end = next device/group)",
+        "  Touch     - a cell, or a row in the left list",
+        "  GRP v ^   - next / previous (OPRT)",
+        "  SRH v ^   - type text, find it in label/pin/tag",
+        "  HOLD      - freeze the display; counts still run"
+      ],
+      [
+        "  LOG       - list of changes with times",
+        "  CLR.CNT   - zero rise/fall counts, min/max, log",
+        "  REGEN     - (OPRT) page 2: rebuild io_map.yaml",
+        "              from live HAL, old copy to .bak",
+        "",
+        "Reading a cell:",
+        "  I / O  - field input / output (PHYS)",
+        "  lamp   - green = active (after invert)",
+        "  value  - number for float / s32 / u32 pins"
+      ],
+      [
+        "  orange outline - changed in the last second",
+        "  ?      - the name is not in HAL (typo, or",
+        "           the device is not loaded)",
+        "Bottom lines: full name, type, direction, the",
+        "linked signal, R/F counts, time since change,",
+        "min/max. Values are read about 20 times a second;",
+        "a shorter pulse can be missed by the lamp - watch",
+        "the R/F counts and the LOG."
+      ],
+      [
+        "io_map.yaml (config dir) - edit with DIR > TEXT:",
+        "  phys: - device: NAME",
+        "          status: [pin, ...]  all TRUE = green",
+        "          points:",
+        "            - {pin: P, tag: T, dir: I, label: L,",
+        "               desc: D, invert: true,",
+        "               bits: {0: RDY, 3: FAULT}}",
+        "  hal:  - group: NAME",
+        "          points: [...same keys...]",
+        "Only pin is needed. bits: shows one lamp for each",
+        "named bit of an int word (drive status word).",
+        "Edits load the next time PHYS / HAL is opened.",
+        "Needs python3-yaml to read the file."
+      ]
+    ]
+  },
+  "SYSTEM_HAL": {
+    "_title": "SYSTEM - HAL",
+    "_body": [
+      [
+        "Live state of the internal HAL signals, grouped",
+        "by hal file and its section headers, plus the",
+        "LINUXCNC and JOINT n groups (enables, homing,",
+        "limits, following error, tool change, spindle).",
+        "Read-only: nothing here changes HAL.",
+        "",
+        "  Arrows    - move the cursor (down the column,",
+        "              off the end = next device/group)",
+        "  Touch     - a cell, or a row in the left list",
+        "  GRP v ^   - next / previous (OPRT)",
+        "  SRH v ^   - type text, find it in label/pin/tag",
+        "  HOLD      - freeze the display; counts still run"
+      ],
+      [
+        "  LOG       - list of changes with times",
+        "  CLR.CNT   - zero rise/fall counts, min/max, log",
+        "  REGEN     - (OPRT) page 2: rebuild io_map.yaml",
+        "              from live HAL, old copy to .bak",
+        "",
+        "Reading a cell:",
+        "  I / O  - field input / output (PHYS)",
+        "  lamp   - green = active (after invert)",
+        "  value  - number for float / s32 / u32 pins"
+      ],
+      [
+        "  orange outline - changed in the last second",
+        "  ?      - the name is not in HAL (typo, or",
+        "           the device is not loaded)",
+        "Bottom lines: full name, type, direction, the",
+        "linked signal, R/F counts, time since change,",
+        "min/max. Values are read about 20 times a second;",
+        "a shorter pulse can be missed by the lamp - watch",
+        "the R/F counts and the LOG."
+      ],
+      [
+        "io_map.yaml (config dir) - edit with DIR > TEXT:",
+        "  phys: - device: NAME",
+        "          status: [pin, ...]  all TRUE = green",
+        "          points:",
+        "            - {pin: P, tag: T, dir: I, label: L,",
+        "               desc: D, invert: true,",
+        "               bits: {0: RDY, 3: FAULT}}",
+        "  hal:  - group: NAME",
+        "          points: [...same keys...]",
+        "Only pin is needed. bits: shows one lamp for each",
+        "named bit of an int word (drive status word).",
+        "Edits load the next time PHYS / HAL is opened.",
+        "Needs python3-yaml to read the file."
+      ]
     ]
   },
   "_DEFAULT": {

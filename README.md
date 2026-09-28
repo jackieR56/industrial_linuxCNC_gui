@@ -20,7 +20,9 @@ This project is still a work in progress and may be unstable, I have yet to comm
 - Python 3.9+
 - `PySDL2` and `pysdl2-dll`
 - SDL2 with `SDL_ttf`
-- A font file set in `interface_test.py`
+- A font file, set by `[GUI]FONT_PATH` in the machine ini
+- `python3-yaml` (PyYAML) to read `io_map.yaml` for the PHYS / HAL IO viewer
+  (without it the viewer still runs on a freshly discovered point list).
 - For probing: the Probe Basic macros in your `SUBROUTINE_PATH` (see
   [`macros/`](macros/)).
 
@@ -47,15 +49,83 @@ SUBROUTINE_PATH = /path/to/macros
 ```
 ---
 
-## Configuration flags
+## Configuration
 
-Set in `App.__init__` (`interface_test.py`):
+Settings are read from the `[GUI]` and `[GUI_COLORS]` sections of the machine
+ini (the one LinuxCNC passes with `-ini`). Every key is optional and falls back
+to a built-in default. See [`gui_settings.sample.ini`](gui_settings.sample.ini)
+for the full list, ready to paste.
 
-- `axes` — `"XYZAC"` or `"XYZ"`
-- `always_show_position` — force the position/modals status pane variant
-- `show_mdi_history` — keep executed MDI blocks listed (default off)
-- `usb_mounts` — auto-mount paths for the panel USB ports
-- `display_units` — persisted; also settable from the OFFSET → SETTING page
+- `[GUI]` — `FONT_PATH`, `FONT_SIZE`, `LARGE_FONT_SIZE`, `USB_MOUNTS`, `AXES`
+  (`XYZAC` or `XYZ`), `ALWAYS_SHOW_POSITION`, `SHOW_MDI_HISTORY`, `IO_MAP`,
+  `IO_FONT_SIZE`, `IO_SAMPLE_MS`
+- `[GUI_COLORS]` — every screen color, as `R, G, B`
+- `[DISPLAY]PROGRAM_PREFIX` — program directory (default `~/linuxcnc/nc_files`)
+- `display_units` — persisted; set from the OFFSET → SETTING page
+
+---
+
+## SYSTEM screen: ini / hal editor
+
+The SYSTEM page maintains the machine configuration from the control:
+
+- **DIR / USB** browse the configuration directory (the folder of the running
+  ini) and the USB mounts. `SELECT` picks a file; `COPY` moves files between
+  the two for backups.
+- **TEXT** is a line/word editor like the program EDIT page.
+- **FIELDS** is a structured view of the same file: one value field per
+  `KEY = value` line of an ini; for a hal file, two cells per statement
+  (`net` signal | pins, `setp` pin | value, `loadrt` comp | args, `addf`
+  func | thread). Comments, blank lines and alignment are kept on save.
+  `APPLY` sends a `setp` to the running HAL right away; `PINS` shows the live
+  values of the pins on the selected line. Both need `halcmd` on the PATH.
+- Every `SAVE` writes `<file>.bak` first; `RESTOR` copies it back.
+- Editing is locked while a program runs.
+
+Typing on TEXT/FIELDS keeps case and accepts every printable character, so use
+an external keyboard there; Shift and Caps Lock stop acting as page keys while
+those pages are open.
+
+Ini and hal edits take effect after a restart of the control. Start LinuxCNC
+through [`run_gui.sh`](run_gui.sh) and the `RESTRT` softkey saves, quits and
+relaunches; started any other way, it reports `NO LAUNCHER` and you exit and
+start again by hand.
+
+### PHYS / HAL: live IO viewer
+
+A read-only, PMC-style signal grid for commissioning and fault finding.
+
+- **PHYS**: field devices, one entry in the left list per device: each
+  EtherCAT slave (from `ethercat-conf.xml` / the `lcec_conf` line in the hal
+  files, plus any live `lcec.*` slave), each userspace driver (`loadusr`
+  components such as a Modbus VFD, or the sim `vpanel`), and RT hardware
+  drivers (`hm2_*`, parport...). The device lamp is green when its status
+  pins (slave online + operational) are all TRUE.
+- **HAL**: the internal signals, grouped by hal file and section header
+  comment, plus `LINUXCNC` (enables, tool change, spindle) and `JOINT n`
+  (amp enable/fault, homing, limits, following error).
+
+Each cell shows I/O (field side), a lamp or value, and the label; the lines
+under the grid give the full name, type, direction, linked signal, rise/fall
+counts, time since the last change and min/max. A cell that changed in the
+last second is outlined. `(OPRT)`: `GRP`, `SRH`, `HOLD` (freeze the display,
+counting continues), `LOG` (timestamped changes), `CLR.CNT`, and `REGEN` on
+page 2.
+
+The point list is `io_map.yaml` in the config dir (`[GUI]IO_MAP`). The
+viewer writes it from the running HAL when it does not exist and never
+overwrites it after that (except `REGEN`, which keeps a `.bak`). Edit it with
+DIR -> TEXT: rename, reorder, delete, add `invert: true` for NC contacts, or
+`bits: {0: RTSO, 3: FAULT}` to show the bits of a drive status word as lamps.
+Changes load the next time PHYS / HAL is opened. Adding a new bus type is one
+discoverer function in [`iomap.py`](iomap.py).
+
+Values are read in-process from HAL about 20 times a second (`[GUI]IO_SAMPLE_MS`),
+so a pulse shorter than that can be missed by the lamp. The counts and the log
+still record it if a sample landed on it.
+
+Parser tests: `python3 -m unittest tests.test_configfile tests.test_iomap` (they run on copies
+of `~/linuxcnc/configs/hmc-sim`).
 
 ---
 
