@@ -1,0 +1,54 @@
+o<tool_length> sub
+
+; skip in the GUI preview interpreter; only run in task
+o10 if [#<_task> EQ 0]
+o10     return
+o10 endif
+
+#<tool> = #5400
+o20 if [#<tool> LE 0]
+    (abort, No tool loaded - use M61 Q<n> or T<n> M6 first)
+o20 endif
+
+; INI values are machine units; refuse to run in the other unit mode
+o30 if [#<_metric_machine> NE #<_metric>]
+    (abort, Switch to machine units G20/G21 before measuring)
+o30 endif
+
+G49
+G90
+G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+G53 G0 X[#<_ini[TOOLSETTER]X>] Y[#<_ini[TOOLSETTER]Y>]
+G53 G0 Z[#<_ini[TOOLSETTER]Z_START>]
+
+; fast search
+G91
+G38.3 Z-[#<_ini[TOOLSETTER]MAXPROBE>] F[#<_ini[TOOLSETTER]SEARCH_VEL>]
+o40 if [#5070 EQ 0]
+    G90
+    G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+    (abort, Toolsetter not tripped on search)
+o40 endif
+
+; back off, slow re-probe
+G0 Z[#<_ini[TOOLSETTER]BACKOFF>]
+G38.3 Z-[#<_ini[TOOLSETTER]BACKOFF> * 2] F[#<_ini[TOOLSETTER]PROBE_VEL>]
+o50 if [#5070 EQ 0]
+    G90
+    G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+    (abort, Toolsetter not tripped on slow probe)
+o50 endif
+G90
+
+; #5063 is in the active WCS; add G5x Z and G92 Z (if active) to get machine Z
+#<trip_mz> = [#5063 + #[5203 + #5220 * 20] + [#5213 * #5210]]
+#<len> = [#<trip_mz> - #<_ini[TOOLSETTER]Z_REF>]
+
+G10 L1 P#<tool> Z#<len>
+G53 G0 Z[#<_ini[TOOLSETTER]Z_SAFE>]
+G43
+
+;(DEBUG, T#<tool> trip machine Z = #<trip_mz> length = #<len>)
+
+o<tool_length> endsub
+M2

@@ -124,9 +124,6 @@ Values are read in-process from HAL about 20 times a second (`[GUI]IO_SAMPLE_MS`
 so a pulse shorter than that can be missed by the lamp. The counts and the log
 still record it if a sample landed on it.
 
-Parser tests: `python3 -m unittest tests.test_configfile tests.test_iomap` (they run on copies
-of `~/linuxcnc/configs/hmc-sim`).
-
 ---
 
 ## Acknowledgements
