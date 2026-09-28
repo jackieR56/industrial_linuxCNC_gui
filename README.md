@@ -43,10 +43,41 @@ DISPLAY = /path/to/interface_test.py
 [RS274NGC]
 SUBROUTINE_PATH = /path/to/macros
 
-[TOOLSENSOR]
-# X, Y, HEIGHT, MAXPROBE, SEARCH_VEL, PROBE_VEL — required for tool probing
-
+[TOOLSETTER]
+# Fixed tool setter for OFFSET -> PROBE -> Z.PRB (macros/tool_length.ngc).
+# All values are MACHINE units, machine coordinates.
+# setter centre
+X = 400.0
+Y = -50.0
+# machine Z for travel to/from the setter
+Z_SAFE = 0.0
+# machine Z to rapid down to; must clear the setter with the longest tool
+Z_START = -150.0
+# search travel down from Z_START (positive); must reach the setter with
+# the shortest tool
+MAXPROBE = 200.0
+# machine units per minute
+SEARCH_VEL = 300.0
+PROBE_VEL = 25.0
+# retract before the slow probe
+BACKOFF = 2.0
+# machine Z at which a zero-length tool trips the setter (spindle gauge line
+# on the trip point); calibrate with a tool of known length
+Z_REF = -420.0
+# optional: motion.digital-in number wired to the setter contact; the macro
+# refuses to descend if it is already tripped
+# PROBE_INPUT = 0
 ```
+
+The numbers above are examples for a metric machine. Every `[TOOLSETTER]` key
+except `PROBE_INPUT` is required; Z.PRB refuses to run (TOOLSETTER NOT
+CONFIGURED) when one is missing, and the OFFSET -> PROBE page shows each value
+or NOT SET. All values are machine units, and the macro (like the work probe
+cycles) refuses to run unless the interpreter is in the machine's unit mode
+(G21 on a metric machine, G20 on an inch one). The Probe Basic
+`tool_sensor.ngc` / `touch_plate.ngc` (which read `[TOOLSENSOR]`) are not used
+and live in `macros/unused/`.
+
 ---
 
 ## Configuration

@@ -5,6 +5,7 @@
 import ctypes
 import math
 import re
+import time
 from collections import deque
 from sdl2 import *
 from sdl2.sdlttf import *
@@ -95,36 +96,45 @@ PANE_SCREENS = {0: "LOADS", 1: "POSMODE", 2: "POSMODE", 5: "POSMODE"}
 #               POS         PROG          OFFSET        GRAPHICS
 
 # ---- probing (Probe Basic macros) ---------------------------------------
+
 # Shared arg list, in the macros' fixed positional order.
+# (key, label, default, kind). kind: LEN = length, FEED = length/min,
+# NUM = unitless (tool number, mode flag, axis select).
+# Values in persist["probe"] and these defaults are MACHINE units; LEN/FEED
+# convert at the P.SET display/entry and at the macro call string (the macros
+# read their args in the interpreter's current G20/G21 mode). Values persisted
+# before the kind column existed were already machine units (the reference
+# machine is mm and they are the metric defaults), so there is no migration.
 PROBE_PARAMS = [
-    ("probe_tool",   "PROBE TOOL NO.",   99),
-    ("max_z",        "MAX Z DIST",       25.0),
-    ("max_xy",       "MAX XY DIST",      25.0),
-    ("xy_clear",     "XY CLEARANCE",     6.0),
-    ("z_clear",      "Z CLEARANCE",      3.0),
-    ("step_off",     "STEP-OFF WIDTH",   12.0),
-    ("extra_depth",  "EXTRA Z DEPTH",    2.0),
-    ("slow_fr",      "PROBE SLOW FR",    30.0),
-    ("fast_fr",      "PROBE FAST FR",    300.0),
-    ("cal_offset",   "CAL OFFSET",       0.0),
-    ("x_hint",       "X HINT",           0.0),
-    ("y_hint",       "Y HINT",           0.0),
-    ("dia_hint",     "DIA HINT",         10.0),
-    ("edge_width",   "EDGE WIDTH",       10.0),
-    ("probe_mode",   "MODE (0=SET WCS)", 0),
+    ("probe_tool",   "PROBE TOOL NO.",   99,    "NUM"),
+    ("max_z",        "MAX Z DIST",       25.0,  "LEN"),
+    ("max_xy",       "MAX XY DIST",      25.0,  "LEN"),
+    ("xy_clear",     "XY CLEARANCE",     6.0,   "LEN"),
+    ("z_clear",      "Z CLEARANCE",      3.0,   "LEN"),
+    ("step_off",     "STEP-OFF WIDTH",   12.0,  "LEN"),
+    ("extra_depth",  "EXTRA Z DEPTH",    2.0,   "LEN"),
+    ("slow_fr",      "PROBE SLOW FR",    30.0,  "FEED"),
+    ("fast_fr",      "PROBE FAST FR",    300.0, "FEED"),
+    ("cal_offset",   "CAL OFFSET",       0.0,   "LEN"),
+    ("x_hint",       "X HINT",           0.0,   "LEN"),
+    ("y_hint",       "Y HINT",           0.0,   "LEN"),
+    ("dia_hint",     "DIA HINT",         10.0,  "LEN"),
+    ("edge_width",   "EDGE WIDTH",       10.0,  "LEN"),
+    ("probe_mode",   "MODE (0=SET WCS)", 0,     "NUM"),
 ]
 
 # Args past #15 are family-specific and #16 means different things to each,
 # so they are appended per macro rather than folded into PROBE_PARAMS (which
 # is the positional contract every macro shares and must stay 15 long).
 PROBE_EXTRA = [
-    ("wco_rot",     "SET WCS ROTATION (1=YES)", 0),      # edge angle  #16
-    ("cal_dia",     "CAL GAUGE DIA",            10.0),   # cal         #16
-    ("cal_x_width", "CAL GAUGE X WIDTH",        10.0),   # cal         #17
-    ("cal_y_width", "CAL GAUGE Y WIDTH",        10.0),   # cal         #18
-    ("cal_axis",    "CAL AXIS (0=AVG 1=X 2=Y)", 0),      # cal         #19
+    ("wco_rot",     "SET WCS ROTATION (1=YES)", 0,    "NUM"),   # edge angle  #16
+    ("cal_dia",     "CAL GAUGE DIA",            10.0, "LEN"),   # cal         #16
+    ("cal_x_width", "CAL GAUGE X WIDTH",        10.0, "LEN"),   # cal         #17
+    ("cal_y_width", "CAL GAUGE Y WIDTH",        10.0, "LEN"),   # cal         #18
+    ("cal_axis",    "CAL AXIS (0=AVG 1=X 2=Y)", 0,    "NUM"),   # cal         #19
 ]
 PROBE_FIELDS = PROBE_PARAMS + PROBE_EXTRA
+PROBE_KIND = {k: kind for k, _l, _d, kind in PROBE_FIELDS}
 
 # page -> {(row, col): (macro, icon_kind)}
 # row 0 = back (+Y), row 2 = front (-Y); col 0 = left (-X), col 2 = right (+X)
@@ -771,6 +781,10 @@ class Screen:
     # ---- override per screen ----
     def on_enter(self):
         pass
+
+    def tick(self):
+        """Per-frame work that must run even while another screen is shown
+        (ScreenManager.draw calls it on every screen). Default: nothing."""
 
     def on_leave(self):
         """Called by the manager before another screen is shown."""
@@ -1847,13 +1861,22 @@ class OffsetScreen(Screen):
     UNIT_CYCLE = ("MACHINE", "MM", "INCH", "PROGRAM")
 
     # ------------------------------------------------------------- lifecycle
+    def __init__(self, app):
+        super().__init__(app)
+        # running probe cycle: None or
+        # {"kind": "WORK"|"TOOL"|"CAL", "state": "ARMED"|"RUNNING", "t0": s}
+        self._probe = None
+        self._probe_note = ""
+        self._tsetter = {}
+        self.wcs_vals = None             # machine units, seeded on entry
+
     def on_enter(self):
         self.chapter = getattr(self, "chapter", "OFFSET")
         self.sub = getattr(self, "sub", "GEOM")          # WEAR | GEOM
         self.scroll = 0
         self.wear = self._load_wear()
         self.comments = self._read_tool_comments()
-        self.wcs_vals = self._read_var_wcs()
+        self._refresh_wcs()
         self._enter_chapter(self.chapter)
 
     def active_keys(self):
@@ -1890,7 +1913,7 @@ class OffsetScreen(Screen):
             self.set_root(self._root_row())
             self._build_setting_cursor()
         elif name == "WORK":
-            self.wcs_vals = self._read_var_wcs()
+            self._refresh_wcs()
             self.set_root(self._root_row([
                 K("PROBE", lambda: self._enter_chapter("WPROBE")),
             ]))
@@ -2043,12 +2066,27 @@ class OffsetScreen(Screen):
                 return {"Z": t.zoffset - w["Z"], "R": t.diameter / 2 - w["R"]}
         return {"Z": 0.0, "R": 0.0}
 
+    def _g10(self, code):
+        """Blocking offset write. False (alarm raised) when the mode switch
+        fails or task has not acknowledged the block after 5 s; callers
+        must not update their local copy then."""
+        try:
+            ok = self.app.mdi(code)
+        except linuxcnc.error as e:
+            self.app.alarm(str(e))
+            return False
+        if not ok:
+            self.app.alarm("G10 NOT ACKNOWLEDGED")
+        return ok
+
     def _write_tool(self, tid):
         g, w = self._geom_of(tid), self._wear_of(tid)
         z = self.app.machine_to_interp(g['Z'] + w['Z'])
         r = self.app.machine_to_interp(g['R'] + w['R'])
-        self.app.mdi(f"G10 L1 P{tid} Z{z:.4f} R{r:.4f}")
+        if not self._g10(f"G10 L1 P{tid} Z{z:.4f} R{r:.4f}"):
+            return False
         self.app.command.load_tool_table()
+        return True
 
     def _set_tool_val(self, tid, col, text, table):
         """Cursor/INPUT path: text is display units."""
@@ -2069,7 +2107,8 @@ class OffsetScreen(Screen):
         else:                                   # GEOM: adjust so geom == val
             w = self._wear_of(tid)[axis]
             mdi_val = self.app.machine_to_interp(val + w)
-            self.app.mdi(f"G10 L1 P{tid} {axis}{mdi_val:.4f}")
+            if not self._g10(f"G10 L1 P{tid} {axis}{mdi_val:.4f}"):
+                return
             self.app.command.load_tool_table()
 
     def _get_tool_val(self, tid, col, table):
@@ -2105,9 +2144,30 @@ class OffsetScreen(Screen):
         self.app.save_persist()
 
     # ------------------------------------------------------------- work data
+    def _refresh_wcs(self):
+        """Page-entry seed. While a program/MDI runs the var file and the
+        offsets are in motion, so the local copy is kept (read once if
+        there is none yet)."""
+        if (self.wcs_vals is None
+                or self.app.stat.interp_state == linuxcnc.INTERP_IDLE):
+            self.wcs_vals = self._read_var_wcs()
+
+    def _wcs_from_stat(self, sys_idx):
+        """Copy the ACTIVE system's offsets from stat (poll first). The var
+        file lags a G10 until task's next command, stat does not."""
+        st = self.app.stat
+        if sys_idx + 1 != st.g5x_index:
+            return False
+        for ax in "XYZABC":
+            self.wcs_vals[sys_idx][ax] = st.g5x_offset[AXIS_IDX[ax]]
+        return True
+
     def _read_var_wcs(self):
         """All nine systems from the var file: {sys_index: {axis: val}}.
-        Machine units. Read on page entry only; edits update locally."""
+        Machine units. Read on page entry only; edits update locally.
+        The var file is flushed only on task's NEXT command, so a G10 just
+        made (e.g. by a probe) is not in it yet: the active system is taken
+        from stat.g5x_offset, which is current."""
         out = {i: {ax: 0.0 for ax in "XYZABC"} for i in range(9)}
         try:
             ini = linuxcnc.ini(self.app.stat.ini_filename)
@@ -2126,6 +2186,11 @@ class OffsetScreen(Screen):
                     out[s][ax] = params.get(base + off, 0.0)
         except (OSError, ValueError):
             pass
+        st = self.app.stat
+        a = st.g5x_index - 1
+        if 0 <= a < 9:
+            for ax in "XYZABC":
+                out[a][ax] = st.g5x_offset[AXIS_IDX[ax]]
         return out
 
     def _set_wcs(self, sys_idx, ax, text):
@@ -2136,8 +2201,11 @@ class OffsetScreen(Screen):
         machine_val = self.app.disp_to_machine(ax, typed)
         mdi_val = (self.app.machine_to_interp(machine_val)
                    if ax in self.app.LINEAR_AXES else machine_val)
-        self.app.mdi(f"G10 L2 P{sys_idx + 1} {ax}{mdi_val:.4f}")
+        if not self._g10(f"G10 L2 P{sys_idx + 1} {ax}{mdi_val:.4f}"):
+            return
         self.wcs_vals[sys_idx][ax] = machine_val       # store machine units
+        self.app.stat.poll()                           # fresh after wait_complete
+        self._wcs_from_stat(sys_idx)
 
     def _build_work_cursor(self):
         axes = self.app.axes
@@ -2199,7 +2267,8 @@ class OffsetScreen(Screen):
         val_m = self.app.disp_to_machine(ax, val)
         mdi_val = (self.app.machine_to_interp(val_m)
                    if ax in self.app.LINEAR_AXES else val_m)
-        self.app.mdi(f"G10 L20 P{sys_idx + 1} {ax}{mdi_val:.4f}")
+        if not self._g10(f"G10 L20 P{sys_idx + 1} {ax}{mdi_val:.4f}"):
+            return
 
         idx = AXIS_IDX[ax]
         st = self.app.stat
@@ -2222,15 +2291,20 @@ class OffsetScreen(Screen):
         self.cursor.commit(f"{self.app.machine_to_disp(txt, rel):.4f}")
 
     def _clear(self, what):
-        for t in self._tools():
-            if what in ("ALL", "WEAR"):
+        tools = self._tools()
+        if what in ("ALL", "WEAR"):
+            for t in tools:
                 self.wear[t.id] = {"Z": 0.0, "R": 0.0}
-            if what in ("ALL", "GEOM"):
-                self.app.mdi(f"G10 L1 P{t.id} Z0 R0")
-        self._save_wear()
+            self._save_wear()
+        if what in ("ALL", "GEOM"):
+            for t in tools:
+                if not self._g10(f"G10 L1 P{t.id} Z0 R0"):
+                    self.app.command.load_tool_table()
+                    return
         if what == "WEAR":                       # re-apply geom minus wear
-            for t in self._tools():
-                self._write_tool(t.id)
+            for t in tools:
+                if not self._write_tool(t.id):
+                    return
         self.app.command.load_tool_table()
         self.pop()
 
@@ -2327,24 +2401,50 @@ class OffsetScreen(Screen):
 
     # ------------------------------------------------------------- probing
     def _pdefaults(self):
+        """persist["probe"], MACHINE units (see PROBE_PARAMS). Keys no
+        longer in PROBE_FIELDS (e.g. an old zero_height) are dropped."""
         d = self.app.persist.setdefault("probe", {})
-        for key, _lbl, dflt in PROBE_FIELDS:
+        stale = [k for k in d if k not in PROBE_KIND]
+        for k in stale:
+            del d[k]
+        for key, _lbl, dflt, _kind in PROBE_FIELDS:
             d.setdefault(key, dflt)
+        if stale:
+            self.app.save_persist()
         return d
 
+    def _pset_disp(self, key):
+        """Stored machine value -> display units (LEN and FEED scale by the
+        same factor; NUM is unitless)."""
+        v = self._pdefaults()[key]
+        if PROBE_KIND[key] == "NUM":
+            return v
+        return self.app.machine_to_disp("Z", v)
+
+    def _pset_text(self, key):
+        v = self._pset_disp(key)
+        if PROBE_KIND[key] == "NUM":
+            return f"{v:g}"
+        t = f"{v:.4f}".rstrip("0").rstrip(".")   # 0.0394 IN stays visible
+        return "0" if t == "-0" else t
+
     def _pset_val(self, key, text):
+        """Typed value is display units for LEN/FEED."""
         try:
-            self._pdefaults()[key] = float(text)
+            v = float(text)
         except ValueError:
             return
+        if PROBE_KIND[key] != "NUM":
+            v = self.app.disp_to_machine("Z", v)
+        self._pdefaults()[key] = v
         self.app.save_persist()
 
     def _build_pset_cursor(self):
         self.cursor = FieldCursor(cols=1)
-        for key, _lbl, _d in PROBE_FIELDS:
+        for key, _lbl, _d, _kind in PROBE_FIELDS:
             self.cursor.add(0, 0, 300, 52,
                 setter=lambda t, k=key: self._pset_val(k, t),
-                getter=lambda k=key: self._pdefaults()[k])
+                getter=lambda k=key: self._pset_disp(k))
 
     def _build_probe_grid(self):
         self.cursor = FieldCursor(cols=3)
@@ -2379,52 +2479,73 @@ class OffsetScreen(Screen):
     def _probe_ready(self):
         st = self.app.stat
         if st.estop or st.task_state != linuxcnc.STATE_ON:
-            self.app.alarms.active.appendleft(
-                {"time": "", "text": "MACHINE NOT READY", "alarm": True})
+            self.app.alarm("MACHINE NOT READY")
             return False
-        if st.interp_state != linuxcnc.INTERP_IDLE:
-            self.app.alarms.active.appendleft(
-                {"time": "", "text": "PROGRAM RUNNING", "alarm": True})
+        if self._probe or st.interp_state != linuxcnc.INTERP_IDLE:
+            self.app.alarm("PROGRAM RUNNING")
+            return False
+        # Args are converted to the current interp units, but the macros'
+        # own constants and the [TOOLSETTER] ini values are not: refuse in
+        # the foreign mode.
+        if (st.program_units == 2) != (st.linear_units == 1.0):
+            self.app.alarm("SWITCH TO MACHINE UNITS (G20/G21) FIRST")
             return False
         return True
+
+    def _arm_probe(self, kind, code):
+        """Fire the macro and start watching for it. Not armed on a mode
+        failure, so no PROBING banner and no read-back."""
+        try:
+            self.app.mdi_async(code)
+        except linuxcnc.error as e:
+            self.app.alarm(str(e))
+            return
+        self._probe = {"kind": kind, "state": "ARMED",
+                       "t0": time.monotonic()}
 
     def _wprobe_exec(self):
         name = self._grid_macro()
         if not name or not self._probe_ready():
             return
         d = self._pdefaults()
-        keys = [k for k, _l, _x in PROBE_PARAMS]
+        keys = [k for k, _l, _x, _kind in PROBE_PARAMS]
         # #16 is wco_rotation to an edge-angle macro but cal_diameter to a cal
         # macro, so the tail is picked by family — never sent to both.
         if name in ANG_MACROS:
             keys += ["wco_rot"]
         elif name in CAL_MACROS:
             keys += ["cal_dia", "cal_x_width", "cal_y_width", "cal_axis"]
-        args = " ".join(f"[{d[k]:g}]" for k in keys)
+        # stored machine units -> interp units; :.4f never emits exponents
+        args = " ".join(
+            f"[{d[k]:g}]" if PROBE_KIND[k] == "NUM"
+            else f"[{self.app.machine_to_interp(d[k]):.4f}]"
+            for k in keys)
         self._probe_note = ""
-        self.app.mdi_async(f"o<{name}> call {args}")
         # CAL derives a stylus correction rather than setting an offset
-        self._probe_pending = "CAL" if self.chapter == "PCAL" else "WORK"
+        self._arm_probe("CAL" if self.chapter == "PCAL" else "WORK",
+                        f"o<{name}> call {args}")
 
     def _tprobe_exec(self):
+        if any(not self._tsetter.get(k) for k, _l in self.TSETTER_KEYS):
+            self.app.alarm("TOOLSETTER NOT CONFIGURED - SEE INI [TOOLSETTER]")
+            return
         if not self._probe_ready():
             return
-        self.app.mdi_async(f"o<{TOOL_SENSOR_MACRO}> call")
-        self._probe_pending = "TOOL"      # reload tool table when idle
+        self._arm_probe("TOOL", f"o<{TOOL_SENSOR_MACRO}> call")
 
     def _draw_pset(self, renderer, f):
-        draw_line(renderer, f, "PROBE SETTINGS", 10, 70)
-        d = self._pdefaults()
+        draw_line(renderer, f,
+                  f"PROBE SETTINGS  ({self.app.unit_tag()})", 10, 70)
         self._scroll_to_cursor(len(PROBE_FIELDS))
         for vis, i in enumerate(range(self.scroll,
                                       min(len(PROBE_FIELDS),
                                           self.scroll + self.VISIBLE_ROWS))):
-            key, label, _x = PROBE_FIELDS[i]
+            key, label, _x, _kind = PROBE_FIELDS[i]
             y = 150 + vis * 66
             draw_line(renderer, f, label, 10, y)
             fld = self.cursor.fields[i]
             fld.x, fld.y, fld.w, fld.h = 560, y - 2, 300, 56
-            draw_field(renderer, f, f"{d[key]:g}", i, self.cursor)
+            draw_field(renderer, f, self._pset_text(key), i, self.cursor)
 
     GRID_X, GRID_Y, CELL = 40, 180, 100
 
@@ -2457,19 +2578,20 @@ class OffsetScreen(Screen):
         st = self.app.stat
         draw_line(renderer, f, cell[0] if cell else "(empty cell)",
                   730, 200, WHITE if cell else RED)
-        d = self._pdefaults()
         draw_line(renderer, f, f"WRITES TO: {WCS[st.g5x_index]}", 730, 260)
         if self.chapter == "PCAL" and cell:
             # Each cal macro positions off one field and compares against
             # another, and they are not always the same one — so name both.
-            labels = dict((k, l) for k, l, _x in PROBE_FIELDS)
+            labels = dict((k, l) for k, l, _x, _kind in PROBE_FIELDS)
             for n, key in enumerate(CAL_FIELDS.get(cell[0], ())):
-                draw_line(renderer, f, f"{labels[key]}: {d[key]:g}",
+                draw_line(renderer, f,
+                          f"{labels[key]}: {self._pset_text(key)}"
+                          f" {self.app.unit_tag()}",
                           730, 320 + n * 46, DIM)
         else:
             draw_line(renderer, f, "DIMS IN [P.SET]", 730, 320,
                       DIM)
-        if getattr(self, "_probe_note", ""):
+        if self._probe_note:
             draw_line(renderer, f, self._probe_note, 730, 510, RED)
         # The routine's own placement instructions, read from its .ngc. Full
         # width below the grid — the macro authors already wrapped these.
@@ -2479,54 +2601,87 @@ class OffsetScreen(Screen):
                 draw_line(renderer, f, txt, 40, 560 + n * 44,
                           DIM if n == 0 else ACCENT)
 
+    # [TOOLSETTER] keys tool_length.ngc needs, all machine units. Order is
+    # the on-screen order (column-major, two columns).
     TSETTER_KEYS = (("X", "SETTER X"), ("Y", "SETTER Y"),
-                    ("Z_REF", "Z REF"), ("Z_SAFE", "Z SAFE"))
+                    ("Z_SAFE", "Z SAFE"), ("Z_START", "Z START"),
+                    ("MAXPROBE", "MAX PROBE"), ("SEARCH_VEL", "SEARCH FEED"),
+                    ("PROBE_VEL", "PROBE FEED"), ("BACKOFF", "BACKOFF"),
+                    ("Z_REF", "Z REF"))
+    TSETTER_OPTIONAL = "PROBE_INPUT"     # setter contact; pre-trip check only
 
     def _read_toolsetter(self):
         """[TOOLSETTER] values the macro runs from, read once on entry so the
         draw loop does no file I/O. None for any key the INI lacks."""
+        keys = [k for k, _l in self.TSETTER_KEYS] + [self.TSETTER_OPTIONAL]
         try:
             ini = linuxcnc.ini(self.app.stat.ini_filename)
-            return {k: ini.find("TOOLSETTER", k) for k, _l in self.TSETTER_KEYS}
+            return {k: ini.find("TOOLSETTER", k) for k in keys}
         except Exception:
-            return {k: None for k, _l in self.TSETTER_KEYS}
+            return {k: None for k in keys}
 
     def _draw_tprobe(self, renderer, f):
         draw_line(renderer, f, "TOOL LENGTH PROBE", 10, 70)
         st = self.app.stat
         draw_line(renderer, f, f"TOOL IN SPINDLE: T{st.tool_in_spindle:02d}",
                   10, 150)
-        vals = getattr(self, "_tsetter", {})
+        vals = self._tsetter
         for n, (key, label) in enumerate(self.TSETTER_KEYS):
             v = vals.get(key)
             draw_line(renderer, f, f"{label}: {v if v else 'NOT SET'}",
-                      10, 230 + n * 46, DIM if v else RED)
+                      10 if n < 5 else 700, 230 + (n % 5) * 46,
+                      DIM if v else RED)
+        pin = vals.get(self.TSETTER_OPTIONAL)
+        draw_line(renderer, f,
+                  f"TRIP INPUT: {pin}" if pin else "TRIP INPUT: NONE (OPTIONAL)",
+                  700, 230 + 4 * 46, DIM)
         if st.tool_in_spindle <= 0:
-            draw_line(renderer, f, "NO TOOL LOADED", 10, 440, RED)
+            draw_line(renderer, f, "NO TOOL LOADED", 10, 520, RED)
         else:
             draw_line(renderer, f,
                       "Z.PRB MEASURES LOADED TOOL, WRITES LENGTH, APPLIES G43",
-                      10, 440, ACCENT)
+                      10, 520, ACCENT)
+
+    PROBE_START_S = 2.0      # ARMED this long with the interp idle = no start
+
+    def tick(self):
+        """Every frame, on every screen (ScreenManager.draw), so a probe
+        started here completes correctly even if the operator pages away.
+        mdi_async returns before task has picked the call up, so idle right
+        after EXEC means "not started yet", not "done": ARMED -> RUNNING on
+        the first non-idle frame, RUNNING -> done on the next idle one."""
+        p = self._probe
+        if not p:
+            return
+        idle = self.app.stat.interp_state == linuxcnc.INTERP_IDLE
+        if p["state"] == "ARMED":
+            if not idle:
+                p["state"] = "RUNNING"
+            elif time.monotonic() - p["t0"] > self.PROBE_START_S:
+                self._probe = None
+                self.app.alarm("PROBE DID NOT START")
+        elif idle:
+            self._probe = None
+            self._probe_done(p["kind"])
 
     def _poll_probe(self, renderer, f):
-        """Called each frame while a probe is running. Keeps the UI live,
-        shows a PROBING banner, and does the read-back exactly when the
-        interpreter returns to idle."""
-        if not getattr(self, "_probe_pending", None):
-            return
-        if self.app.stat.interp_state == linuxcnc.INTERP_IDLE:
-            kind = self._probe_pending
-            self._probe_pending = None
-            if kind == "WORK":
-                self.wcs_vals = self._read_var_wcs()
-            elif kind == "TOOL":
-                self.app.command.load_tool_table()
-            elif kind == "CAL":
-                # the macro computes the correction; entering it is manual
-                # until the storage location is confirmed on the machine
-                self._probe_note = "CAL DONE - ENTER RESULT AS CAL OFFSET"
-        else:
+        """PROBING banner while a probe is armed or running."""
+        if self._probe:
             draw_line(renderer, f, "PROBING...", 730, 130, RED)
+
+    def _probe_done(self, kind):
+        st = self.app.stat
+        if kind == "WORK":
+            # macros write with G10 L20 P0 = the active system; the var file
+            # is not flushed yet, stat is
+            st.poll()
+            self._wcs_from_stat(st.g5x_index - 1)
+        elif kind == "TOOL":
+            self.app.command.load_tool_table()
+        elif kind == "CAL":
+            # the macro computes the correction; entering it is manual
+            # until the storage location is confirmed on the machine
+            self._probe_note = "CAL DONE - ENTER RESULT AS CAL OFFSET"
 
 
 # SystemScreen lives in systemscreen.py
@@ -2747,6 +2902,9 @@ class ScreenManager:
             fn(action)
 
     def draw(self, renderer):
+        # background work for every screen (probe completion watchdog...)
+        for s in self.screens.values():
+            s.tick()
         # --- active screen, clipped between status bar and input line ---
         SDL_RenderSetClipRect(renderer, self.content)
         self.active.draw(renderer, self.content)
