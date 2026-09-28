@@ -259,7 +259,7 @@
       "that file. SAVE writes <file>.bak first.",
       "The control must be restarted for a change to",
       "take effect: (OPRT) RESTRT.",
-      "EXIT stops the control (CAN / EXEC)."
+      "EXIT stops the control (CAN / EXEC). Both need the machine OFF."
     ]
   },
   "SYSTEM_DIR": {
@@ -374,7 +374,7 @@
       "the restart launcher (run_gui.sh) is in use.",
       "",
       "(OPRT) RESTRT - save and restart the control.",
-      "EXIT stops the control (CAN / EXEC)."
+      "EXIT stops the control (CAN / EXEC). Both need the machine OFF."
     ]
   },
   "MESSAGE": {
