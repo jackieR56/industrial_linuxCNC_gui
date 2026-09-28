@@ -15,6 +15,7 @@ import json
 import os
 import settings
 import configfile
+import tooltbl
 
 WHITE = settings.sdl_color("TEXT", (255, 255, 255))
 RED   = settings.sdl_color("ALARM", (250, 0, 0))
@@ -34,9 +35,9 @@ KEY_X0, KEY_W = 60, 180 # [<] 0-60, ten keys, [>] 1860-1920
 BUFFER_H = 54           # input line band above the softkey frame
 PANE_W   = 460          # status pane width (statuspane imports this)
 
-# NOTE for the read-only-rootfs deployment: point this at the writable
-# data partition.
-WEAR_FILE = os.path.join(os.path.dirname(__file__), "tool_wear.json")
+# Tool wear now lives in tool.tbl (see tooltbl.py). The old side file is
+# only looked for to import it once (OffsetScreen._migrate_legacy_wear).
+LEGACY_WEAR_FILE = os.path.join(os.path.dirname(__file__), "tool_wear.json")
 
 # Probe macros. LinuxCNC resolves these by SUBROUTINE_PATH when it runs them;
 # we only read them here, to show the operator the routine's own placement
@@ -1874,8 +1875,7 @@ class OffsetScreen(Screen):
         self.chapter = getattr(self, "chapter", "OFFSET")
         self.sub = getattr(self, "sub", "GEOM")          # WEAR | GEOM
         self.scroll = 0
-        self.wear = self._load_wear()
-        self.comments = self._read_tool_comments()
+        self._read_table()
         self._refresh_wcs()
         self._enter_chapter(self.chapter)
 
@@ -1992,7 +1992,6 @@ class OffsetScreen(Screen):
     # ------------------------------------------------------------- tool data
     # Internal wear/geom values are MACHINE units; conversion only at the
     # MDI strings (interp units) and the display/entry membrane.
-    _T_RE = re.compile(r'^\s*[Tt](\d+)\b')
 
     def _tools(self):
         # real entries only: skip index 0 spindle slot, id -1 empties
@@ -2006,56 +2005,86 @@ class OffsetScreen(Screen):
             tbl = "tool.tbl"
         return os.path.join(os.path.dirname(self.app.stat.ini_filename), tbl)
 
-    def _read_tool_comments(self):
-        """{tool_id: comment} from the .tbl (text after ';' on each T line)."""
-        out = {}
-        try:
-            with open(self._tool_tbl_path()) as f:
-                for line in f:
-                    m = self._T_RE.match(line)
-                    if m and ";" in line:
-                        out[int(m.group(1))] = line.split(";", 1)[1].strip()
-        except OSError:
-            pass
-        return out
-
-    def _set_tool_comment(self, tid, text):
-        """Rewrite the ;comment on tool tid's .tbl line, then reload so
-        LinuxCNC's in-memory copy carries it (its own G10-triggered rewrites
-        preserve the comment field)."""
+    # tool.tbl is the single source of truth: LinuxCNC's Z/diameter is
+    # geometry + wear combined, and the wear share is a ";W:Z.. R.." token
+    # at the start of the tool's comment (machine units, tooltbl.py). A G10
+    # L1 from anywhere keeps the comment, so the split cannot drift apart.
+    def _read_table(self):
+        """Refresh self.wear / self.comments (user text only, token
+        stripped) from the .tbl. Runs the one-time JSON import first."""
         path = self._tool_tbl_path()
         try:
-            with open(path) as f:
-                lines = f.readlines()
-            for i, line in enumerate(lines):
-                m = self._T_RE.match(line)
-                if m and int(m.group(1)) == tid:
-                    base = line.split(";", 1)[0].rstrip()
-                    t = text.strip()
-                    lines[i] = (f"{base} ;{t}\n" if t else base + "\n")
-                    break
-            with open(path, "w") as f:
-                f.writelines(lines)
+            tbl = tooltbl.read_table(path)
+        except OSError:
+            tbl = {}
+        # an unreadable/empty table is not "no tokens": leave the JSON alone
+        if (tbl and os.path.exists(LEGACY_WEAR_FILE)
+                and self._migrate_legacy_wear(path, tbl)):
+            try:
+                tbl = tooltbl.read_table(path)
+            except OSError:
+                tbl = {}
+        self.wear = {tid: dict(e["wear"]) for tid, e in tbl.items()}
+        self.comments = {tid: e["comment"] for tid, e in tbl.items()}
+
+    def _migrate_legacy_wear(self, path, tbl):
+        """Old tool_wear.json -> tokens, once. Imported only when no tool
+        in the table carries a token yet; either way the JSON is renamed
+        to .migrated so this never runs twice. True if the .tbl changed."""
+        changed = False
+        try:
+            if any(e["tagged"] for e in tbl.values()):
+                os.replace(LEGACY_WEAR_FILE, LEGACY_WEAR_FILE + ".migrated")
+                self.app.alarm("OLD TOOL_WEAR.JSON IGNORED (RENAMED)")
+                return False
+            with open(LEGACY_WEAR_FILE) as f:
+                old = {int(k): v for k, v in json.load(f).items()}
+            for tid, w in old.items():
+                z, r = float(w.get("Z", 0.0)), float(w.get("R", 0.0))
+                if tid in tbl and (z or r):
+                    tooltbl.write_comment(path, tid, z, r, tbl[tid]["comment"])
+                    changed = True
+            os.replace(LEGACY_WEAR_FILE, LEGACY_WEAR_FILE + ".migrated")
+            if changed:
+                self.app.command.load_tool_table()
+            self.app.alarm("TOOL WEAR MOVED INTO TOOL.TBL")
+        except (OSError, ValueError, AttributeError, TypeError) as e:
+            self.app.alarm(f"TOOL WEAR MIGRATION FAILED: {e}")
+        return changed
+
+    def _write_wear_token(self, tid, z, r, text=None):
+        """File half of every wear/comment change. False (alarm raised) on
+        failure. Callers then load_tool_table so LinuxCNC's in-memory
+        comment -- which its own G10 rewrites put back -- carries it."""
+        if text is None:
+            text = self.comments.get(tid, "")
+        try:
+            tooltbl.write_comment(self._tool_tbl_path(), tid, z, r, text)
         except OSError as e:
-            self.app.alarms.active.appendleft({
-                "time": "", "text": f"TOOL.TBL WRITE FAILED: {e}",
-                "alarm": True})
+            self.app.alarm(f"TOOL.TBL WRITE FAILED: {e}")
+            return False
+        except KeyError:
+            self.app.alarm(f"T{tid} NOT FOUND IN TOOL.TBL")
+            return False
+        return True
+
+    def _reload_table(self):
+        """load_tool_table and wait for task to take it, so a following
+        G10 L1 rewrites the file from the fresh copy (comment included)."""
+        self.app.command.load_tool_table()
+        self.app.command.wait_complete()
+
+    def _set_tool_comment(self, tid, text):
+        """Rewrite the user text of tool tid's comment, keeping its wear
+        token, then reload so LinuxCNC's in-memory copy carries it."""
+        w = self._wear_of(tid)
+        if not self._write_wear_token(tid, w["Z"], w["R"], text):
             return
         self.app.command.load_tool_table()
-        self.comments = self._read_tool_comments()
-
-    def _load_wear(self):
-        try:
-            with open(WEAR_FILE) as f:
-                return {int(k): v for k, v in json.load(f).items()}
-        except (OSError, ValueError):
-            return {}
-
-    def _save_wear(self):
-        with open(WEAR_FILE, "w") as f:
-            json.dump(self.wear, f, indent=1)
+        self._read_table()
 
     def _wear_of(self, tid):
+        """In-memory copy of the .tbl token; not persisted from here."""
         return self.wear.setdefault(tid, {"Z": 0.0, "R": 0.0})
 
     def _geom_of(self, tid):
@@ -2079,8 +2108,11 @@ class OffsetScreen(Screen):
             self.app.alarm("G10 NOT ACKNOWLEDGED")
         return ok
 
-    def _write_tool(self, tid):
-        g, w = self._geom_of(tid), self._wear_of(tid)
+    def _write_tool(self, tid, geom=None):
+        """G10 L1 with geom + wear. Pass geom when wear has just changed:
+        _geom_of derives it from the stored value minus the CURRENT wear,
+        so it must be taken before the wear is edited."""
+        g, w = geom or self._geom_of(tid), self._wear_of(tid)
         z = self.app.machine_to_interp(g['Z'] + w['Z'])
         r = self.app.machine_to_interp(g['R'] + w['R'])
         if not self._g10(f"G10 L1 P{tid} Z{z:.4f} R{r:.4f}"):
@@ -2101,9 +2133,24 @@ class OffsetScreen(Screen):
         """Machine-units entry point (MEASUR and probe cycles)."""
         axis = "Z" if col == 0 else "R"
         if table == "WEAR":
-            self._wear_of(tid)[axis] = val
-            self._save_wear()
-            self._write_tool(tid)
+            # order: token into the file, reload (LinuxCNC's in-memory
+            # comment now has it), then the G10 -- whose table rewrite
+            # keeps that comment.
+            geom = self._geom_of(tid)            # before the wear changes
+            w = self._wear_of(tid)
+            old = dict(w)
+            new = dict(w, **{axis: val})
+            if not self._write_wear_token(tid, new["Z"], new["R"]):
+                return
+            self._reload_table()
+            w.update(new)
+            if not self._write_tool(tid, geom):
+                # G10 refused: put the old token back so stored - wear
+                # still gives the old geometry
+                w.update(old)
+                if self._write_wear_token(tid, old["Z"], old["R"]):
+                    self.app.command.load_tool_table()
+            self._read_table()
         else:                                   # GEOM: adjust so geom == val
             w = self._wear_of(tid)[axis]
             mdi_val = self.app.machine_to_interp(val + w)
@@ -2292,29 +2339,44 @@ class OffsetScreen(Screen):
 
     def _clear(self, what):
         tools = self._tools()
+        geoms = {t.id: self._geom_of(t.id) for t in tools}   # before any change
         if what in ("ALL", "WEAR"):
-            for t in tools:
+            for t in tools:                      # one pass of zero tokens
+                w = self._wear_of(t.id)
+                if w["Z"] or w["R"]:
+                    if not self._write_wear_token(t.id, 0.0, 0.0):
+                        self.app.command.load_tool_table()
+                        self._read_table()
+                        return
                 self.wear[t.id] = {"Z": 0.0, "R": 0.0}
-            self._save_wear()
-        if what in ("ALL", "GEOM"):
+            self._reload_table()
+        if what == "ALL":
             for t in tools:
                 if not self._g10(f"G10 L1 P{t.id} Z0 R0"):
-                    self.app.command.load_tool_table()
-                    return
-        if what == "WEAR":                       # re-apply geom minus wear
+                    break
+        elif what == "GEOM":                     # geometry 0: stored = wear
             for t in tools:
-                if not self._write_tool(t.id):
-                    return
+                w = self._wear_of(t.id)
+                z = self.app.machine_to_interp(w["Z"])
+                r = self.app.machine_to_interp(w["R"])
+                if not self._g10(f"G10 L1 P{t.id} Z{z:.4f} R{r:.4f}"):
+                    break
+        elif what == "WEAR":                     # re-apply geom, wear now 0
+            for t in tools:
+                if not self._write_tool(t.id, geoms[t.id]):
+                    break
         self.app.command.load_tool_table()
+        self._read_table()
         self.pop()
 
     def _read_exec(self):
         self.app.command.load_tool_table()
-        self.wear = self._load_wear()
-        self.comments = self._read_tool_comments()
+        self._read_table()
 
     def _punch_exec(self):
-        self._save_wear()                        # .tbl persists via G10 L1 already
+        # Nothing to save: every edit already landed in tool.tbl (G10 L1
+        # and the wear token). Kept as a reload, same as READ.
+        self._read_exec()
 
     # ------------------------------------------------------------- draw
     def draw(self, renderer, area):
@@ -2677,7 +2739,25 @@ class OffsetScreen(Screen):
             st.poll()
             self._wcs_from_stat(st.g5x_index - 1)
         elif kind == "TOOL":
+            # Contract with tool_length.ngc: it writes the MEASURED length
+            # with G10 L1 (no wear) and G43s it. The .tbl comment, token
+            # included, survives that rewrite, so wear is read back here
+            # and re-added as geometry = measured; then G43 again so the
+            # active length includes the wear too.
             self.app.command.load_tool_table()
+            st.poll()
+            self._read_table()
+            tid = st.tool_in_spindle
+            if tid > 0 and self._wear_of(tid)["Z"] != 0:
+                measured = next((t.zoffset for t in st.tool_table
+                                 if t.id == tid), None)
+                if measured is not None:
+                    self._set_tool_machine(tid, 0, measured, "GEOM")
+                    try:
+                        if not self.app.mdi("G43"):
+                            self.app.alarm("G43 NOT ACKNOWLEDGED")
+                    except linuxcnc.error as e:
+                        self.app.alarm(str(e))
         elif kind == "CAL":
             # the macro computes the correction; entering it is manual
             # until the storage location is confirmed on the machine

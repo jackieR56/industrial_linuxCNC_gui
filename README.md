@@ -100,6 +100,12 @@ M-code; each rising edge counts one part, and from the first pulse on the
 GUI's own count is switched off. Without it the GUI counts AUTO cycles that
 end without RESET or an error.
 
+**Tool wear.** Wear is stored inside the tool table (`[EMCIO]TOOL_TABLE`) as a
+`;W:Z<z> R<r>` prefix on each tool's comment, in machine units; the table's
+Z/diameter is geometry + wear, and the OFFSET page shows geometry as table
+value minus wear. When editing `tool.tbl` by hand, keep the token. An old
+`tool_wear.json` is imported once and renamed to `tool_wear.json.migrated`.
+
 ---
 
 ## SYSTEM screen: ini / hal editor
