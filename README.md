@@ -38,7 +38,7 @@ On the machine, LinuxCNC launches the GUI as its display program. In the ini:
 ```ini
 
 [DISPLAY]
-DISPLAY = /path/to/interface_test.py
+DISPLAY = /path/to/industrial_gui.py
 
 [RS274NGC]
 SUBROUTINE_PATH = /path/to/macros

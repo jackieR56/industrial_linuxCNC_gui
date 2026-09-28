@@ -314,7 +314,7 @@ class Backplot2D:
         """Worker thread: gcode.parse into a segment list. No SDL here.
         Reads only the `stat` snapshot built by load() — no live stat, no
         ini, no os.environ writes. INI_FILE_NAME (read by the preview
-        interpreter) is set at import time in interface_test.py, right
+        interpreter) is set at import time in industrial_gui.py, right
         after `import settings`, before any worker can start."""
         path = stat.file
         error = None

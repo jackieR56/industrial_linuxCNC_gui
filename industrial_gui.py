@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# interface_test.py
+# industrial_gui.py — LinuxCNC [DISPLAY] program: SDL window, main loop, App state
 
 import os
 import re

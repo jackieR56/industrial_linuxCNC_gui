@@ -2,7 +2,7 @@
 # units.py - pure display/entry unit conversion (no sdl2 / linuxcnc).
 #
 # UNITS POLICY: all *stored* state is in MACHINE units; these helpers are the
-# display/entry membrane. App (interface_test.py) wraps them with live stat:
+# display/entry membrane. App (industrial_gui.py) wraps them with live stat:
 #   machine_mm = (stat.linear_units == 1.0)
 #   program_mm = (stat.program_units == 2)      # G21 active
 
