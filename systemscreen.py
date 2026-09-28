@@ -5,7 +5,7 @@
 #
 # Chapters:  DIR  USB  TEXT  FIELDS  INFO  PHYS  HAL
 #   DIR/USB  browse the config directory / a USB drive, SELECT a file
-#   TEXT     line/word editor over the selected file (ProgScreen EDIT clone)
+#   TEXT     line/word editor over the selected file (lineeditor.py, as PROG EDIT)
 #   FIELDS   ini:  one value field per KEY = value line
 #            hal:  two cells per statement (net: signal|pins, setp: pin|value,
 #                  loadrt: comp|args, addf: func|thread), APPLY / PINS live
@@ -29,7 +29,9 @@ from sdl2 import *
 
 import configfile
 import settings
+from filebrowser import FileBrowser
 from ioview import IoModel, IoView
+from lineeditor import LineEditor
 from screens import (Screen, K, FieldCursor, draw_line, text_width,
                      WHITE, RED, BLACK, DIM, ACCENT, KEY_HILITE,
                      SOFTKEY_Y, BUFFER_H)
@@ -72,16 +74,19 @@ class SystemScreen(Screen):
         self.ini_doc = None             # for [SEC]KEY resolution in hal docs
         self.hal = configfile.Hal()
         self.note = ""
-        # browser
-        self.dir_path = None
-        self.usb_path = None
-        self.entries = []
-        self.file_cur = 0
-        self.file_scroll = 0
-        # text editor
-        self.edit_cur = 0
-        self.edit_word = 0
-        self.edit_scroll = 0
+        # browser: one per chapter, each keeps its directory between visits
+        hide = lambda n: n.startswith(".") or n.endswith(".tmp")
+        self.files = {
+            "DIR": FileBrowser(lambda: self.config_dir, self.FILE_ROWS, hide),
+            "USB": FileBrowser(self._first_usb, self.FILE_ROWS, hide),
+        }
+        # text editor (keeps case and the file's own spacing)
+        self.editor = LineEditor(
+            lambda: self.doc.lines if self.doc else None,
+            lambda i, t: self.doc.set_line(i, t),
+            lambda i, t: self.doc.insert_line(i, t),
+            lambda i: self.doc.delete_line(i),
+            take_space=True)
         # fields
         self.scroll = 0
         self.field_lines = []           # per field: (line, lo, hi)
@@ -279,7 +284,7 @@ class SystemScreen(Screen):
             self.note = f"CANNOT READ {os.path.basename(path)}: {e.strerror or e}"
             return False
         self.sel_path = path
-        self.edit_cur = self.edit_word = self.edit_scroll = 0
+        self.editor.cur = self.editor.word = self.editor.scroll = 0
         self.scroll = 0
         self.pins_on = False
         return True
@@ -288,13 +293,13 @@ class SystemScreen(Screen):
         if self.doc is None:
             return
         idx = self.cursor.idx if self.cursor else 0
-        cur = self.edit_cur
+        cur = self.editor.cur
         if self._load_doc(self.doc.path):
             if self.chapter == "FIELDS":
                 self._build_fields()
                 if self.cursor:
                     self.cursor.idx = min(idx, len(self.cursor.fields) - 1)
-            self.edit_cur = min(cur, len(self.doc.lines) - 1)
+            self.editor.cur = min(cur, len(self.doc.lines) - 1)
 
     def _save(self):
         if not self._editable():
@@ -389,57 +394,15 @@ class SystemScreen(Screen):
         self.app.quit = True
 
     # ------------------------------------------------------------- browser
-    def _root(self):
-        if self.chapter == "USB":
-            for m in self.app.usb_mounts:
-                if os.path.isdir(m):
-                    return m
-            return None
-        return self.config_dir
-
-    def _base(self):
-        return self.usb_path if self.chapter == "USB" else self.dir_path
-
-    def _set_base(self, base):
-        if self.chapter == "USB":
-            self.usb_path = base
-        else:
-            self.dir_path = base
+    def _browser(self):
+        return self.files[self.chapter]
 
     def _refresh_files(self):
-        root = self._root()
-        self.entries = []
-        self.file_cur = 0
-        self.file_scroll = 0
-        if root is None:
+        if not self._browser().refresh(self.sel_path):
             self.note = "NO USB MOUNTED"
-            return
-        base = self._base()
-        if not base or not (base == root or base.startswith(root + os.sep)):
-            base = root
-        try:
-            names = sorted(os.listdir(base), key=str.upper)
-        except OSError:
-            base = root
-            try:
-                names = sorted(os.listdir(base), key=str.upper)
-            except OSError:
-                names = []
-        if base != root:
-            self.entries.append(("..", True, os.path.dirname(base)))
-        for n in names:
-            if n.startswith(".") or n.endswith(".tmp"):
-                continue
-            p = os.path.join(base, n)
-            self.entries.append((n, os.path.isdir(p), p))
-        self.entries.sort(key=lambda e: (e[0] != "..", not e[1], e[0].upper()))
-        self._set_base(base)
-        for i, e in enumerate(self.entries):     # land on the selected file
-            if e[2] == self.sel_path:
-                self.file_cur = i
 
     def _cur_entry(self):
-        return self.entries[self.file_cur] if self.entries else None
+        return self._browser().cur_entry()
 
     def _file_select(self):
         e = self._cur_entry()
@@ -447,7 +410,7 @@ class SystemScreen(Screen):
             return
         name, is_dir, path = e
         if is_dir:
-            self._set_base(path)
+            self._browser().path = path
             self._refresh_files()
             return
         if self.doc is not None and self.doc.dirty and path != self.doc.path:
@@ -513,77 +476,35 @@ class SystemScreen(Screen):
             self._reload_doc()
 
     # ------------------------------------------------------------- text editor
-    def _edit_words(self):
-        line = self.doc.lines[self.edit_cur]
-        return [(m.start(), m.end()) for m in re.finditer(r'\S+', line)]
-
-    def _clamp_word(self):
-        n = len(self._edit_words()) if self.doc else 0
-        self.edit_word = max(0, min(self.edit_word, max(0, n - 1)))
-
     def _edit_insert_word(self):
         if not self._editable():
             return
-        text = self.app.input.take().strip()
-        if not text:
-            return
-        line = self.doc.lines[self.edit_cur]
-        words = self._edit_words()
-        if not words:
-            self.doc.set_line(self.edit_cur, text)
-            self.edit_word = 0
-        else:
-            _s, end = words[self.edit_word]
-            self.doc.set_line(self.edit_cur, line[:end] + " " + text + line[end:])
-            self.edit_word += 1
-        self._clamp_word()
+        self.editor.insert_word(self.app.input.take())
 
     def _edit_alter(self):
         if not self._editable():
             return
-        text = self.app.input.take().strip()
-        words = self._edit_words()
-        if not text or not words:
-            return
-        s, e = words[self.edit_word]
-        line = self.doc.lines[self.edit_cur]
-        self.doc.set_line(self.edit_cur, line[:s] + text + line[e:])
+        self.editor.alter(self.app.input.take())
 
     def _edit_delete_word(self):
         if not self._editable():
             return
-        words = self._edit_words()
-        if not words:
-            return
-        s, e = words[self.edit_word]
-        line = self.doc.lines[self.edit_cur]
-        # take the following space with the word, or the preceding one at EOL
-        if e < len(line) and line[e] == " ":
-            e += 1
-        elif s > 0 and line[s - 1] == " ":
-            s -= 1
-        self.doc.set_line(self.edit_cur, line[:s] + line[e:])
-        self._clamp_word()
+        self.editor.delete_word()
 
     def _edit_alter_line(self):
         if not self._editable():
             return
-        self.doc.set_line(self.edit_cur, self.app.input.take())
-        self.edit_word = 0
+        self.editor.alter_line(self.app.input.take())
 
     def _edit_insert_line(self):
         if not self._editable():
             return
-        self.doc.insert_line(self.edit_cur + 1, self.app.input.take())
-        self.edit_cur += 1
-        self.edit_word = 0
+        self.editor.insert_line(self.app.input.take())
 
     def _edit_delete_line(self):
         if not self._editable():
             return
-        self.doc.delete_line(self.edit_cur)
-        self.edit_cur = min(self.edit_cur, len(self.doc.lines) - 1)
-        self._clamp_word()
+        self.editor.delete_line()
 
     def edit_key(self, action):
         """Physical ALTER/INSERT/DELETE keys."""
@@ -605,16 +526,14 @@ class SystemScreen(Screen):
     # ------------------------------------------------------------- search
     def _cur_line(self):
         if self.chapter == "TEXT":
-            return self.edit_cur
+            return self.editor.cur
         if self.cursor and self.field_lines:
             return self.field_lines[self.cursor.idx][0]
         return 0
 
     def _goto_line(self, i):
         if self.chapter == "TEXT":
-            self.edit_cur = i
-            self.edit_word = 0
-            self._clamp_word()
+            self.editor.goto(i)
         elif self.cursor:
             for k, (line, _lo, _hi) in enumerate(self.field_lines):
                 if line >= i:
@@ -794,36 +713,24 @@ class SystemScreen(Screen):
         if ch in self.io:
             return self.io[ch].on_key(sc)
         if ch in ("DIR", "USB"):
-            n = max(0, len(self.entries) - 1)
-            if sc == SDL_SCANCODE_UP:
-                self.file_cur = max(0, self.file_cur - 1); return True
-            if sc == SDL_SCANCODE_DOWN:
-                self.file_cur = min(n, self.file_cur + 1); return True
-            if sc == SDL_SCANCODE_PAGEUP:
-                self.file_cur = max(0, self.file_cur - self.FILE_ROWS); return True
-            if sc == SDL_SCANCODE_PAGEDOWN:
-                self.file_cur = min(n, self.file_cur + self.FILE_ROWS); return True
+            if self._browser().on_key(sc):
+                return True
             if sc == SDL_SCANCODE_RETURN:
                 self._file_select(); return True
         elif ch == "TEXT" and self.doc is not None:
-            last = len(self.doc.lines) - 1
+            ed = self.editor
             if sc == SDL_SCANCODE_UP:
-                self.edit_cur = max(0, self.edit_cur - 1)
-                self._clamp_word(); return True
+                ed.move(-1); return True
             if sc == SDL_SCANCODE_DOWN:
-                self.edit_cur = min(last, self.edit_cur + 1)
-                self._clamp_word(); return True
+                ed.move(+1); return True
             if sc == SDL_SCANCODE_LEFT:
-                self.edit_word = max(0, self.edit_word - 1); return True
+                ed.move_word(-1); return True
             if sc == SDL_SCANCODE_RIGHT:
-                self.edit_word += 1
-                self._clamp_word(); return True
+                ed.move_word(+1); return True
             if sc == SDL_SCANCODE_PAGEUP:
-                self.edit_cur = max(0, self.edit_cur - self.EDIT_ROWS)
-                self._clamp_word(); return True
+                ed.page(-1, self.EDIT_ROWS); return True
             if sc == SDL_SCANCODE_PAGEDOWN:
-                self.edit_cur = min(last, self.edit_cur + self.EDIT_ROWS)
-                self._clamp_word(); return True
+                ed.page(+1, self.EDIT_ROWS); return True
             if sc == SDL_SCANCODE_RETURN:
                 self._edit_insert_line(); return True
         elif ch == "FIELDS" and self.cursor:
@@ -839,10 +746,8 @@ class SystemScreen(Screen):
         if self.chapter in self.io:
             return self.io[self.chapter].on_touch(x, y)
         if self.chapter in ("DIR", "USB"):
-            for ry, idx in self._vis_rows:
-                if ry - 2 <= y < ry + 56:
-                    self.file_cur = idx
-                    return True
+            if self._browser().hit(y, self._vis_rows):
+                return True
         elif self.chapter == "FIELDS" and self.cursor:
             for k in self._vis_fields:
                 f = self.cursor.fields[k]
@@ -893,45 +798,11 @@ class SystemScreen(Screen):
             draw_line(renderer, f, w, 1910 - text_width(f, w), self.TITLE_Y,
                       ACCENT)
 
-    def _hilite_row(self, renderer, f, text, x, y, w, active, color=WHITE):
-        if active:
-            SDL_SetRenderDrawColor(renderer, *KEY_HILITE, 255)
-            SDL_RenderFillRect(renderer, SDL_Rect(x - 4, y - 2, w, 56))
-            draw_line(renderer, f, text, x, y, BLACK)
-        else:
-            draw_line(renderer, f, text, x, y, color)
-
     def _draw_files(self, renderer, f):
-        base = self._base()
-        self._title(renderer, f, f"{self.chapter}  {base or '-'}")
-        if not self.entries:
-            draw_line(renderer, f, "(empty)", 10, 130)
-            return
-        if self.file_cur < self.file_scroll:
-            self.file_scroll = self.file_cur
-        elif self.file_cur >= self.file_scroll + self.FILE_ROWS:
-            self.file_scroll = self.file_cur - self.FILE_ROWS + 1
-        vis = []
-        for row, idx in enumerate(range(self.file_scroll,
-                                        min(len(self.entries),
-                                            self.file_scroll + self.FILE_ROWS))):
-            name, is_dir, path = self.entries[idx]
-            if is_dir:
-                text = f"<DIR>  {name}"
-            else:
-                try:
-                    size = os.path.getsize(path)
-                    text = f"{size // 1024:5d}K  {name}" if size >= 1024 \
-                           else f"{size:5d}B  {name}"
-                except OSError:
-                    text = f"    ?  {name}"
-            sel = (path == self.sel_path)
-            y = 130 + row * 60
-            vis.append((y, idx))
-            self._hilite_row(renderer, f, ("> " if sel else "  ") + text,
-                             10, y, 1300, idx == self.file_cur,
-                             ACCENT if sel else WHITE)
-        self._vis_rows = tuple(vis)
+        b = self._browser()
+        self._title(renderer, f, f"{self.chapter}  {b.path or '-'}")
+        self._vis_rows = b.draw(renderer, f, 130, 60, mark=True,
+                                selected_path=self.sel_path)
 
     def _draw_text(self, renderer, f):
         self._title(renderer, f,
@@ -940,23 +811,21 @@ class SystemScreen(Screen):
             draw_line(renderer, f, "NO FILE SELECTED - USE DIR", 10, 130)
             return
         lines = self.doc.lines
-        if self.edit_cur < self.edit_scroll:
-            self.edit_scroll = self.edit_cur
-        elif self.edit_cur >= self.edit_scroll + self.EDIT_ROWS:
-            self.edit_scroll = self.edit_cur - self.EDIT_ROWS + 1
-        for row, idx in enumerate(range(self.edit_scroll,
+        ed = self.editor
+        ed.scroll_to_cursor(self.EDIT_ROWS)
+        for row, idx in enumerate(range(ed.scroll,
                                         min(len(lines),
-                                            self.edit_scroll + self.EDIT_ROWS))):
+                                            ed.scroll + self.EDIT_ROWS))):
             line = lines[idx].rstrip("\r").expandtabs(4)
             prefix = f"{idx + 1:4d} "
             y = 130 + row * self.ROW_H
             draw_line(renderer, f, self._fit(f, prefix + line, 1900), 10, y)
-            if idx != self.edit_cur:
+            if idx != ed.cur:
                 continue
             spans = [(m.start(), m.end()) for m in re.finditer(r'\S+', line)]
             if spans:
-                self._clamp_word()
-                s, e = spans[min(self.edit_word, len(spans) - 1)]
+                ed.clamp_word()
+                s, e = spans[min(ed.word, len(spans) - 1)]
                 x0 = 10 + text_width(f, prefix + line[:s])
                 if x0 < 1900:
                     wpx = text_width(f, line[s:e])

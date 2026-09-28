@@ -31,9 +31,10 @@ import configfile
 import units
 
 from screens import (draw_line, text_width, InputBuffer,
-                     PosScreen, ProgScreen, OffsetScreen,
+                     PosScreen, ProgScreen,
                      MessageScreen, GraphicsScreen,
                      ScreenManager, WCS)
+from offsets import OffsetScreen
 from systemscreen import SystemScreen
 
 # ---------------------------------------------------------------------------
